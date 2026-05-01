@@ -1,0 +1,10 @@
+[package]
+name = "pirate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+serde = { version = "*", features = ["derive"] }
+serde_bencode = "*"
+serde_bytes = "0.11.19"
