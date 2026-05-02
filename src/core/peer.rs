@@ -1,7 +1,7 @@
 use crate::core::torrent::Torrent;
 use anyhow::{bail, Context, Result};
 use std::{net::Ipv4Addr, time::Duration};
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
 
 #[derive(Debug)]
 pub struct Peer {
@@ -32,94 +32,97 @@ impl Peer {
             }
         }
 
-        let socket = UdpSocket::bind("0.0.0.0:6881")
-            .await
-            .context("[!] Failed to bind socket to the following address: '0.0.0.0:6881'")?;
-
+        let mut set = JoinSet::new();
         for tracker_url in trackers {
-            if !tracker_url.starts_with("udp://") {
-                continue;
-            }
+            set.spawn(async move { tracker_handshake(tracker_url, info_hash, left_len).await });
+        }
 
-            let parsed_url = match url::Url::parse(&tracker_url) {
-                Ok(url) => url,
-                Err(_) => continue,
-            };
-
-            let host = match parsed_url.host_str() {
-                Some(h) => h,
-                None => continue,
-            };
-
-            let port = parsed_url.port().unwrap_or(80);
-            let tracker_address = format!("{}:{}", host, port);
-
-            println!("[*] Trying to connect to tracker: {}", tracker_url);
-
-            if socket.connect(&tracker_address).await.is_err() {
-                continue;
-            }
-
-            let connection_req = ConnectionRequest::default().serialize();
-
-            if socket.send(&connection_req).await.is_err() {
-                continue;
-            }
-
-            let mut res = [0u8; 16];
-            if timeout(Duration::from_secs(2), socket.recv(&mut res))
-                .await
-                .is_err()
-            {
-                println!("[-] Connection timeout for {}", tracker_url);
-                continue;
-            }
-
-            let connection_id = &res[8..16];
-
-            let mut announce_req = AnnounceRequest::default();
-            announce_req.connection_id =
-                i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
-
-            announce_req.info_hash = info_hash;
-            announce_req.left = left_len;
-
-            if socket.send(&announce_req.serialize()).await.is_err() {
-                continue;
-            }
-
-            let mut peer_res = vec![0u8; 1024];
-            let size = match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                socket.recv(&mut peer_res),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    println!("[!] Failed to receive peers from {tracker_url}\nError: {e}");
-                    continue;
-                }
-                _ => {
-                    println!("[-] Announce connection timeout for {}", tracker_url);
-                    continue;
-                }
-            };
-
-            peer_res.truncate(size);
-
-            if let Ok(parsed_res) = AnnounceResponse::parse(peer_res) {
-                println!(
-                    "[+] Received {} peer from {}",
-                    parsed_res.peers.len(),
-                    tracker_url
-                );
-                return Ok(parsed_res.peers);
+        while let Some(res) = set.join_next().await {
+            if let Ok(Ok(peers)) = res {
+                return Ok(peers);
             }
         }
 
         bail!("[!] All trackers failed");
     }
+}
+
+async fn tracker_handshake(url: String, info_hash: [u8; 20], left_len: i64) -> Result<Vec<Peer>> {
+    if !url.starts_with("udp://") {
+        bail!("[!] The tracker's url must start with 'udp://'");
+    }
+
+    let parsed_url = match url::Url::parse(&url) {
+        Ok(url) => url,
+        Err(e) => bail!("[!] Failed to parse the tracker's url: {e}"),
+    };
+
+    let host = match parsed_url.host_str() {
+        Some(h) => h,
+        None => bail!("[!] Failed to get the host from the url"),
+    };
+
+    let port = parsed_url.port().unwrap_or(80);
+    let tracker_address = format!("{}:{}", host, port);
+
+    println!("[*] Trying to connect to tracker: {}", url);
+
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("[!] Failed to bind the socket")?;
+
+    socket
+        .connect(&tracker_address)
+        .await
+        .context("[!] Failed to connect to the tracker address")?;
+
+    let connection_req = ConnectionRequest::default().serialize();
+
+    socket
+        .send(&connection_req)
+        .await
+        .context("[!] Failed to send the connection request to the tracker")?;
+
+    let mut res = [0u8; 16];
+    timeout(Duration::from_secs(2), socket.recv(&mut res))
+        .await
+        .context("[!] Failed to receive the connection id from the tracker")?
+        .context("[-] Tracker timeout")?;
+
+    let connection_id = &res[8..16];
+
+    let mut announce_req = AnnounceRequest::default();
+    announce_req.connection_id = i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
+
+    announce_req.info_hash = info_hash;
+    announce_req.left = left_len;
+
+    socket
+        .send(&announce_req.serialize())
+        .await
+        .context("[!] Failed to send the announce request to the tracker")?;
+
+    let mut peer_res = vec![0u8; 1024];
+    let size = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.recv(&mut peer_res),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            bail!("[!] Failed to receive peers from {url}\nError: {e}");
+        }
+        _ => {
+            bail!("[-] Announce connection timeout for {url}");
+        }
+    };
+
+    peer_res.truncate(size);
+
+    Ok(AnnounceResponse::parse(peer_res)
+        .context("[!] Failed to parse the response with peers")?
+        .peers)
 }
 
 #[derive(Debug)]
