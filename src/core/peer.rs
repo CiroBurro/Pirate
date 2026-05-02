@@ -2,6 +2,7 @@ use crate::core::torrent::Torrent;
 use anyhow::{bail, Context, Result};
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
+use tracing::{info, instrument, warn};
 
 #[derive(Debug)]
 pub struct Peer {
@@ -10,6 +11,7 @@ pub struct Peer {
 }
 
 impl Peer {
+    #[instrument(skip(torrent))]
     pub async fn get_peers(torrent: Torrent) -> Result<Vec<Peer>> {
         let info_hash = torrent
             .info
@@ -32,14 +34,28 @@ impl Peer {
             }
         }
 
+        info!(
+            "Found {} trackers inside the announce list.",
+            trackers.len()
+        );
+
         let mut set = JoinSet::new();
         for tracker_url in trackers {
             set.spawn(async move { tracker_handshake(tracker_url, info_hash, left_len).await });
         }
 
         while let Some(res) = set.join_next().await {
-            if let Ok(Ok(peers)) = res {
-                return Ok(peers);
+            match res {
+                Ok(Ok(peers)) => {
+                    info!(peers_number = peers.len(), "Peers' list obtained.");
+                    return Ok(peers);
+                }
+                Ok(Err(e)) => {
+                    warn!(error = ?e, "A tracker failed, waiting for the others.");
+                }
+                Err(e) => {
+                    warn!("A tracker task crashed: {}", e);
+                }
             }
         }
 
@@ -47,6 +63,7 @@ impl Peer {
     }
 }
 
+#[instrument(skip(info_hash, left_len))]
 async fn tracker_handshake(url: String, info_hash: [u8; 20], left_len: i64) -> Result<Vec<Peer>> {
     if !url.starts_with("udp://") {
         bail!("[!] The tracker's url must start with 'udp://'");
@@ -65,7 +82,7 @@ async fn tracker_handshake(url: String, info_hash: [u8; 20], left_len: i64) -> R
     let port = parsed_url.port().unwrap_or(80);
     let tracker_address = format!("{}:{}", host, port);
 
-    println!("[*] Trying to connect to tracker: {}", url);
+    info!("[*] Trying to connect to tracker: {}", url);
 
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
@@ -74,20 +91,21 @@ async fn tracker_handshake(url: String, info_hash: [u8; 20], left_len: i64) -> R
     socket
         .connect(&tracker_address)
         .await
-        .context("[!] Failed to connect to the tracker address")?;
+        .with_context(|| format!("[!] Failed to connect to the tracker: {url}"))?;
 
     let connection_req = ConnectionRequest::default().serialize();
 
-    socket
-        .send(&connection_req)
-        .await
-        .context("[!] Failed to send the connection request to the tracker")?;
+    socket.send(&connection_req).await.with_context(|| {
+        format!("[!] Failed to send the connection request to the tracker: {url}")
+    })?;
 
     let mut res = [0u8; 16];
     timeout(Duration::from_secs(2), socket.recv(&mut res))
         .await
-        .context("[!] Failed to receive the connection id from the tracker")?
-        .context("[-] Tracker timeout")?;
+        .with_context(|| {
+            format!("[!] Failed to receive the connection id from the tracker: {url}")
+        })?
+        .with_context(|| format!("[-] Tracker timeout: {url}"))?;
 
     let connection_id = &res[8..16];
 
@@ -100,7 +118,9 @@ async fn tracker_handshake(url: String, info_hash: [u8; 20], left_len: i64) -> R
     socket
         .send(&announce_req.serialize())
         .await
-        .context("[!] Failed to send the announce request to the tracker")?;
+        .with_context(|| {
+            format!("[!] Failed to send the announce request to the tracker: {url}")
+        })?;
 
     let mut peer_res = vec![0u8; 1024];
     let size = match tokio::time::timeout(
@@ -121,7 +141,9 @@ async fn tracker_handshake(url: String, info_hash: [u8; 20], left_len: i64) -> R
     peer_res.truncate(size);
 
     Ok(AnnounceResponse::parse(peer_res)
-        .context("[!] Failed to parse the response with peers")?
+        .with_context(|| {
+            format!("[!] Failed to parse the response with peers from tracker: {url}")
+        })?
         .peers)
 }
 
