@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_bencode::de;
 use serde_bytes::ByteBuf;
@@ -8,6 +9,8 @@ use tokio::fs;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Torrent {
     pub announce: String,
+    #[serde(rename = "announce-list")]
+    pub announce_list: Option<Vec<Vec<String>>>,
     pub info: Info,
     pub comment: Option<String>,
     #[serde(rename = "creation date")]
@@ -15,9 +18,12 @@ pub struct Torrent {
 }
 
 impl Torrent {
-    pub async fn from_file(path: PathBuf) -> Result<Torrent, Box<dyn std::error::Error>> {
-        let data = fs::read(path).await?;
-        let torrent: Torrent = de::from_bytes(&data)?;
+    pub async fn from_file(path: PathBuf) -> Result<Torrent> {
+        let data = fs::read(path)
+            .await
+            .context("[!] Failed to read the torrent file")?;
+        let torrent: Torrent =
+            de::from_bytes(&data).context("[!] Failed to deserialize the torrent file content")?;
 
         Ok(torrent)
     }
@@ -34,8 +40,8 @@ pub struct Info {
 }
 
 impl Info {
-    pub fn get_info_hash(&self) -> Result<[u8; 20], Box<dyn std::error::Error>> {
-        let bencoded_info = serde_bencode::to_bytes(self)?;
+    pub fn get_info_hash(&self) -> Result<[u8; 20]> {
+        let bencoded_info = serde_bencode::to_bytes(self).context("[!] Failed to encode the Info data structure of the torrent file to calcultate the hash")?;
 
         let mut hasher = Sha1::new();
         hasher.update(&bencoded_info);
@@ -47,15 +53,15 @@ impl Info {
         Ok(hash)
     }
 
-    pub fn total_len(&self) -> Result<i64, Box<dyn std::error::Error>> {
+    pub fn total_len(&self) -> Result<i64> {
         if self.length.is_some() {
             return Ok(self.length.unwrap());
         } else if self.files.is_some() {
             let mut len: i64 = 0;
-            self.files.clone().unwrap().iter().map(|f| len += f.length);
+            let _ = self.files.clone().unwrap().iter().map(|f| len += f.length);
             return Ok(len);
         } else {
-            todo!()
+            return Err(anyhow!("[!] Both file length and files list are missing"));
         }
     }
 }
