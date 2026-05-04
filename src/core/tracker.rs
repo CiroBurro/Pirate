@@ -93,7 +93,7 @@ pub async fn tracker_handshake(
 }
 
 #[derive(Debug)]
-pub struct ConnectionRequest {
+struct ConnectionRequest {
     protocol_id: i64,
     action: u32,
     transaction_id: u64,
@@ -110,7 +110,7 @@ impl Default for ConnectionRequest {
 }
 
 impl ConnectionRequest {
-    pub fn serialize(&self) -> Vec<u8> {
+    fn serialize(&self) -> Vec<u8> {
         let mut req = Vec::with_capacity(16);
         req.extend_from_slice(&self.protocol_id.to_be_bytes());
         req.extend_from_slice(&self.action.to_be_bytes());
@@ -179,17 +179,17 @@ impl AnnounceRequest {
 }
 
 #[derive(Debug)]
-pub struct AnnounceResponse {
-    action: i32,
-    transaction_id: i32,
-    interval: i32,
-    leechers: i32,
-    seeders: i32,
+struct AnnounceResponse {
+    _action: i32,
+    _transaction_id: i32,
+    _interval: i32,
+    _leechers: i32,
+    _seeders: i32,
     peers: Vec<Peer>,
 }
 
 impl AnnounceResponse {
-    pub fn parse(res: Vec<u8>) -> Result<Self> {
+    fn parse(res: Vec<u8>) -> Result<Self> {
         let slice = res.as_slice();
 
         let mut peers: Vec<Peer> = Vec::new();
@@ -210,27 +210,27 @@ impl AnnounceResponse {
         }
 
         Ok(Self {
-            action: i32::from_be_bytes(
+            _action: i32::from_be_bytes(
                 slice[0..4]
                     .try_into()
                     .context("[!] Failed to convert action bytes into an integer")?,
             ),
-            transaction_id: i32::from_be_bytes(
+            _transaction_id: i32::from_be_bytes(
                 slice[4..8]
                     .try_into()
                     .context("[!] Failed to convert transaction id bytes into an integer")?,
             ),
-            interval: i32::from_be_bytes(
+            _interval: i32::from_be_bytes(
                 slice[8..12]
                     .try_into()
                     .context("[!] Failed to convert interval bytes into an integer")?,
             ),
-            leechers: i32::from_be_bytes(
+            _leechers: i32::from_be_bytes(
                 slice[12..16]
                     .try_into()
                     .context("[!] Failed to convert leechers bytes into an integer")?,
             ),
-            seeders: i32::from_be_bytes(
+            _seeders: i32::from_be_bytes(
                 slice[16..20]
                     .try_into()
                     .context("[!] Failed to convert seeders bytes into an integer")?,

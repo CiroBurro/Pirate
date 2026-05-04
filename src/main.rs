@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
 
-    let peers = Peer::get_peers(torrent).await?;
+    let _ = Peer::get_peers(&torrent).await?;
 
     Ok(())
 }
