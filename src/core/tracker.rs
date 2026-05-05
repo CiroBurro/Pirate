@@ -1,13 +1,69 @@
-use crate::core::peer::Peer;
+use crate::core::{
+    peer::{Peer, PeerStatus},
+    torrent::Torrent,
+};
 use anyhow::{bail, Context, Result};
 use std::{net::Ipv4Addr, time::Duration};
-use tokio::{net::UdpSocket, time::timeout};
-use tracing::{info, instrument};
+use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
+use tracing::{info, instrument, warn};
+
+#[instrument(skip(torrent))]
+pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
+    let info_hash = torrent.info_hash;
+    let peer_id = torrent.peer_id;
+    let left_len = torrent
+        .file
+        .info
+        .total_len()
+        .context("[!] Failed to get the total length of the files to download")?;
+
+    let mut trackers = vec![torrent.file.announce.clone()];
+
+    if let Some(announce_list) = &torrent.file.announce_list {
+        for tier in announce_list {
+            for tracker in tier {
+                if !trackers.contains(tracker) {
+                    trackers.push(tracker.clone());
+                }
+            }
+        }
+    }
+
+    info!(
+        "Found {} trackers inside the announce list.",
+        trackers.len()
+    );
+
+    let mut set = JoinSet::new();
+    for tracker_url in trackers {
+        set.spawn(
+            async move { tracker_handshake(tracker_url, info_hash, peer_id, left_len).await },
+        );
+    }
+
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(peers)) => {
+                info!(peers_number = peers.len(), "Peers' list obtained.");
+                return Ok(peers);
+            }
+            Ok(Err(e)) => {
+                warn!(error = ?e, "A tracker failed, waiting for the others.");
+            }
+            Err(e) => {
+                warn!("A tracker task crashed: {}", e);
+            }
+        }
+    }
+
+    bail!("[!] All trackers failed");
+}
 
 #[instrument(skip(info_hash, left_len))]
 pub async fn tracker_handshake(
     url: String,
     info_hash: [u8; 20],
+    peer_id: [u8; 20],
     left_len: i64,
 ) -> Result<Vec<Peer>> {
     if !url.starts_with("udp://") {
@@ -53,12 +109,8 @@ pub async fn tracker_handshake(
         .with_context(|| format!("[-] Tracker timeout: {url}"))?;
 
     let connection_id = &res[8..16];
-
-    let mut announce_req = AnnounceRequest::default();
-    announce_req.connection_id = i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
-
-    announce_req.info_hash = info_hash;
-    announce_req.left = left_len;
+    let connection_id = i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
+    let announce_req = AnnounceRequest::new(connection_id, info_hash, peer_id, left_len);
 
     socket
         .send(&announce_req.serialize())
@@ -136,16 +188,16 @@ struct AnnounceRequest {
     port: u16,
 }
 
-impl Default for AnnounceRequest {
-    fn default() -> Self {
+impl AnnounceRequest {
+    fn new(connection_id: i64, info_hash: [u8; 20], peer_id: [u8; 20], left: i64) -> Self {
         Self {
-            connection_id: 0,
+            connection_id,
             action: 1,
             transaction_id: 12345,
-            info_hash: [0; 20],
-            peer_id: *b"-PR0001-012345678901",
+            info_hash,
+            peer_id,
             downloaded: 0,
-            left: 0,
+            left,
             uploaded: 0,
             event: 0,
             ip_address: 0,
@@ -206,6 +258,7 @@ impl AnnounceResponse {
                         .try_into()
                         .context("[!] Failed to convert port bytes into an integer")?,
                 ),
+                status: PeerStatus::default(),
             });
         }
 

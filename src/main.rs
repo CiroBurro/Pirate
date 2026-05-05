@@ -1,7 +1,8 @@
+pub mod client;
 pub mod core;
 
 use core::peer::Peer;
-use core::torrent::Torrent;
+use core::torrent_file::TorrentFile;
 use std::path::PathBuf;
 use tokio;
 use tracing_subscriber::{self, EnvFilter};
@@ -14,13 +15,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_line_number(true)
         .with_target(false)
         .init();
-
-    let torrent = Torrent::from_file(PathBuf::from(
-        "/home/ciro/Documenti/Progetti/pirate/big-buck-bunny.torrent",
-    ))
-    .await?;
-
-    let _ = Peer::get_peers(&torrent).await?;
 
     Ok(())
 }
