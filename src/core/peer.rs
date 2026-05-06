@@ -1,5 +1,5 @@
-use crate::core::torrent::Torrent;
-use anyhow::{Context, Result};
+use crate::core::{message::Message, torrent::Torrent};
+use anyhow::{Context, Result, bail};
 use std::net::Ipv4Addr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,7 +16,7 @@ pub struct Peer {
 
 impl Peer {
     #[instrument(skip(torrent))]
-    pub async fn handshake(&self, torrent: &Torrent) -> Result<TcpStream> {
+    pub async fn handshake(&mut self, torrent: &Torrent) -> Result<()> {
         let mut handshake = PeerHandshake::default();
         handshake.info_hash = torrent.info_hash;
 
@@ -52,7 +52,56 @@ impl Peer {
             )
         })?;
 
-        Ok(stream)
+        self.status.stream = Some(stream);
+
+        Ok(())
+    }
+
+    #[instrument]
+    pub async fn send_msg(&mut self, message: Message) -> Result<()> {
+        if let Some(stream) = self.status.stream.as_mut() {
+            stream
+                .write_all(&message.serialize())
+                .await
+                .with_context(|| format!("Failed to send message to peer: {}", self.to_string()))?;
+
+            info!(
+                "Message: {:?} sent to the peer: {}",
+                message,
+                self.to_string()
+            )
+        } else {
+            bail!(
+                "[!] Trying to send a message but there is no open stream with the peer: {}",
+                self.to_string()
+            );
+        }
+
+        Ok(())
+    }
+
+    #[instrument]
+    pub async fn read_msg(&mut self) -> Result<Message> {
+        if let Some(stream) = self.status.stream.as_mut() {
+            let mut buf_len = [0u8; 4];
+            stream
+                .read_exact(&mut buf_len)
+                .await
+                .context("Failed to read message length from peer")?;
+
+            let len = u32::from_be_bytes(buf_len);
+            let mut data = vec![0u8; len as usize];
+            stream.read_exact(&mut data).await.with_context(|| {
+                format!("Failed to read message from peer: {}", self.to_string())
+            })?;
+
+            Message::parse(len, data)
+        } else {
+            bail!(
+                "[!] Trying to read a message but there is no open stream with the peer: {}",
+                self.to_string()
+            );
+        }
     }
 }
 
