@@ -32,10 +32,10 @@ impl TorrentFile {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
     #[serde(rename = "piece length")]
-    pub piece_date: i32,
+    pub piece_length: i32,
     pub pieces: ByteBuf,
     pub name: String,
-    pub length: Option<i64>,
+    pub length: Option<usize>,
     pub files: Option<Vec<File>>,
 }
 
@@ -53,11 +53,11 @@ impl Info {
         Ok(hash)
     }
 
-    pub fn total_len(&self) -> Result<i64> {
+    pub fn total_len(&self) -> Result<usize> {
         if self.length.is_some() {
             return Ok(self.length.unwrap());
         } else if self.files.is_some() {
-            let mut len: i64 = 0;
+            let mut len: usize = 0;
             let _ = self.files.clone().unwrap().iter().map(|f| len += f.length);
             return Ok(len);
         } else {
@@ -68,6 +68,6 @@ impl Info {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct File {
-    pub length: i64,
+    pub length: usize,
     pub path: Vec<String>,
 }

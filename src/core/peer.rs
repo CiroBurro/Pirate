@@ -1,5 +1,5 @@
-use crate::core::{message::Message, torrent::Torrent};
-use anyhow::{Context, Result, bail};
+use crate::core::{bitfield::BitField, message::Message, torrent::Torrent};
+use anyhow::{bail, Context, Result};
 use std::net::Ipv4Addr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -15,10 +15,11 @@ pub struct Peer {
 }
 
 impl Peer {
-    #[instrument(skip(torrent))]
-    pub async fn handshake(&mut self, torrent: &Torrent) -> Result<()> {
+    #[instrument(skip(info_hash, peer_id))]
+    pub async fn handshake(&mut self, info_hash: [u8; 20], peer_id: [u8; 20]) -> Result<()> {
         let mut handshake = PeerHandshake::default();
-        handshake.info_hash = torrent.info_hash;
+        handshake.info_hash = info_hash;
+        handshake.peer_id = peer_id;
 
         let socket = TcpSocket::new_v4().context("[!] Failed to create a new TCP socket")?;
 
@@ -57,19 +58,12 @@ impl Peer {
         Ok(())
     }
 
-    #[instrument]
     pub async fn send_msg(&mut self, message: Message) -> Result<()> {
         if let Some(stream) = self.status.stream.as_mut() {
             stream
                 .write_all(&message.serialize())
                 .await
                 .with_context(|| format!("Failed to send message to peer: {}", self.to_string()))?;
-
-            info!(
-                "Message: {:?} sent to the peer: {}",
-                message,
-                self.to_string()
-            )
         } else {
             bail!(
                 "[!] Trying to send a message but there is no open stream with the peer: {}",
@@ -80,7 +74,6 @@ impl Peer {
         Ok(())
     }
 
-    #[instrument]
     pub async fn read_msg(&mut self) -> Result<Message> {
         if let Some(stream) = self.status.stream.as_mut() {
             let mut buf_len = [0u8; 4];
@@ -145,6 +138,7 @@ impl PeerHandshake {
 pub struct PeerStatus {
     pub choked: bool,
     pub stream: Option<TcpStream>,
+    pub bitfield: BitField,
 }
 
 impl Default for PeerStatus {
@@ -152,6 +146,7 @@ impl Default for PeerStatus {
         Self {
             choked: false,
             stream: None,
+            bitfield: BitField::new(),
         }
     }
 }

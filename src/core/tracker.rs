@@ -59,12 +59,12 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
     bail!("[!] All trackers failed");
 }
 
-#[instrument(skip(info_hash, left_len))]
+#[instrument(skip(info_hash, peer_id, left_len))]
 pub async fn tracker_handshake(
     url: String,
     info_hash: [u8; 20],
     peer_id: [u8; 20],
-    left_len: i64,
+    left_len: usize,
 ) -> Result<Vec<Peer>> {
     if !url.starts_with("udp://") {
         bail!("[!] The tracker's url must start with 'udp://'");
@@ -110,7 +110,7 @@ pub async fn tracker_handshake(
 
     let connection_id = &res[8..16];
     let connection_id = i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
-    let announce_req = AnnounceRequest::new(connection_id, info_hash, peer_id, left_len);
+    let announce_req = AnnounceRequest::new(connection_id, info_hash, peer_id, left_len as i64);
 
     socket
         .send(&announce_req.serialize())
