@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
 #[derive(Debug)]
 pub enum MessageId {
@@ -11,6 +11,7 @@ pub enum MessageId {
     Request,
     Piece,
     Cancel,
+    KeepAlive,
 }
 
 impl TryFrom<u8> for MessageId {
@@ -43,6 +44,7 @@ impl From<&MessageId> for u8 {
             MessageId::Request => 6,
             MessageId::Piece => 7,
             MessageId::Cancel => 8,
+            MessageId::KeepAlive => 255,
         }
     }
 }
@@ -55,8 +57,20 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn keep_alive() -> Self {
+        Self {
+            len: 0,
+            id: MessageId::KeepAlive,
+            payload: Vec::with_capacity(0),
+        }
+    }
+
     pub fn parse(len: u32, data: Vec<u8>) -> Result<Self> {
         let slice = data.as_slice();
+
+        if len == 0 {
+            return Ok(Self::keep_alive());
+        }
 
         let id = MessageId::try_from(u8::from_be(slice[0]))
             .context("[!] Failed to parse the message id")?;

@@ -16,10 +16,10 @@ pub struct Peer {
 
 impl Peer {
     #[instrument(skip(info_hash, peer_id))]
-    pub async fn handshake(&mut self, info_hash: [u8; 20], peer_id: [u8; 20]) -> Result<()> {
+    pub async fn handshake(&mut self, info_hash: &[u8; 20], peer_id: &[u8; 20]) -> Result<()> {
         let mut handshake = PeerHandshake::default();
-        handshake.info_hash = info_hash;
-        handshake.peer_id = peer_id;
+        handshake.info_hash = *info_hash;
+        handshake.peer_id = *peer_id;
 
         let socket = TcpSocket::new_v4().context("[!] Failed to create a new TCP socket")?;
 
@@ -83,6 +83,11 @@ impl Peer {
                 .context("Failed to read message length from peer")?;
 
             let len = u32::from_be_bytes(buf_len);
+
+            if len == 0 {
+                return Ok(Message::keep_alive());
+            }
+
             let mut data = vec![0u8; len as usize];
             stream.read_exact(&mut data).await.with_context(|| {
                 format!("Failed to read message from peer: {}", self.to_string())

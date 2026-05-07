@@ -81,4 +81,18 @@ impl PiecePicker {
             missing_pieces: num_pieces,
         }
     }
+
+    pub fn add_peer_bitfield(&mut self, bitfield: &BitField) {
+        for i in 0..self.pieces.len() {
+            if bitfield.has_piece(i) {
+                self.piece_frequencies[i] += 1;
+            }
+        }
+    }
+
+    pub fn add_peer_have(&mut self, index: usize) {
+        if index < self.piece_frequencies.len() {
+            self.piece_frequencies[index] += 1;
+        }
+    }
 }
