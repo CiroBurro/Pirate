@@ -57,14 +57,6 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn keep_alive() -> Self {
-        Self {
-            len: 0,
-            id: MessageId::KeepAlive,
-            payload: Vec::with_capacity(0),
-        }
-    }
-
     pub fn parse(len: u32, data: Vec<u8>) -> Result<Self> {
         let slice = data.as_slice();
 
@@ -83,9 +75,93 @@ impl Message {
         let mut buf = Vec::new();
 
         buf.extend_from_slice(&self.len.to_be_bytes());
+        if self.len == 0 {
+            return buf;
+        }
+
         buf.extend_from_slice(&u8::from(&self.id).to_be_bytes());
         buf.extend_from_slice(self.payload.as_slice());
 
         buf
+    }
+
+    pub fn keep_alive() -> Self {
+        Self {
+            len: 0,
+            id: MessageId::KeepAlive,
+            payload: Vec::with_capacity(0),
+        }
+    }
+
+    pub fn choke() -> Self {
+        Self {
+            len: 1,
+            id: MessageId::Choke,
+            payload: Vec::with_capacity(0),
+        }
+    }
+
+    pub fn unchoke() -> Self {
+        Self {
+            len: 1,
+            id: MessageId::Unchoke,
+            payload: Vec::with_capacity(0),
+        }
+    }
+
+    pub fn interested() -> Self {
+        Self {
+            len: 1,
+            id: MessageId::Interested,
+            payload: Vec::with_capacity(0),
+        }
+    }
+
+    pub fn uninterested() -> Self {
+        Self {
+            len: 1,
+            id: MessageId::NotInterested,
+            payload: Vec::with_capacity(0),
+        }
+    }
+
+    pub fn have(index: u32) -> Self {
+        Self {
+            len: 5,
+            id: MessageId::Have,
+            payload: index.to_be_bytes().to_vec(),
+        }
+    }
+
+    pub fn bitfield(payload: Vec<u8>) -> Self {
+        Self {
+            len: 1 + payload.len() as u32,
+            id: MessageId::BitField,
+            payload,
+        }
+    }
+
+    pub fn request(payload: [u8; 12]) -> Self {
+        Self {
+            len: 13,
+            id: MessageId::Request,
+            payload: payload.to_vec(),
+        }
+    }
+
+    pub fn piece(payload: Vec<u8>) -> Self {
+        Self {
+            len: 9 + payload.len() as u32,
+            id: MessageId::Piece,
+            payload,
+        }
+    }
+
+    pub fn cancel(payload: [u8; 12]) -> Self {
+        Self {
+            len: 13,
+            id: MessageId::Cancel,
+            payload: payload.to_vec(),
+        }
     }
 }
