@@ -1,5 +1,5 @@
-use crate::core::{bitfield::BitField, message::Message, torrent::Torrent};
-use anyhow::{bail, Context, Result};
+use crate::core::{bitfield::BitField, message::Message};
+use anyhow::{Context, Result, bail};
 use std::net::Ipv4Addr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

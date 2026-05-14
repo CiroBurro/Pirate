@@ -2,7 +2,7 @@ use crate::core::{
     peer::{Peer, PeerStatus},
     torrent::Torrent,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
 use tracing::{info, instrument, warn};

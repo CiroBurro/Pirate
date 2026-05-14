@@ -61,7 +61,7 @@ impl Torrent {
             .context("[!] Failed to get peers from tracker")?;
 
         torrent.peers = peers;
-        info!("Torrent created succesfully");
+        info!("Torrent created successfully");
 
         Ok(torrent)
     }
@@ -112,7 +112,7 @@ impl Torrent {
     #[instrument(skip(self))]
     pub async fn download(mut self) -> Result<()> {
         self.activate_peers().await;
-        if self.peers.len() <= 0 {
+        if self.peers.len() == 0 {
             bail!("[!] The torrent has no active peers");
         }
         info!("Found {} active peers", self.peers.len());
@@ -152,7 +152,6 @@ impl Torrent {
                 }
             });
         }
-
         Ok(())
     }
 }
