@@ -28,6 +28,15 @@ impl Block {
             timer: 5,
         }
     }
+
+    pub fn to_payload(&self) -> Vec<u8> {
+        [
+            self.piece_index.to_be_bytes(),
+            self.offset.to_be_bytes(),
+            self.length.to_be_bytes(),
+        ]
+        .concat()
+    }
 }
 
 #[derive(Debug, PartialEq)]
