@@ -124,37 +124,45 @@ impl Torrent {
         Ok(())
     }
 
-    async fn peer_loop(mut peer: Peer, piece_picker: Arc<Mutex<PiecePicker>>) {
+    async fn peer_loop(mut peer: Peer, piece_picker: Arc<Mutex<PiecePicker>>) -> Result<()> {
         loop {
             let msg_result = peer.read_msg().await;
             if let Ok(msg) = msg_result {
-                Self::handle_msg(&mut peer, &piece_picker, msg).await;
+                Self::handle_msg(&mut peer, &piece_picker, msg).await?;
             } else if let Err(e) = msg_result {
                 error!("{e}")
             }
         }
     }
 
-    pub async fn handle_msg(peer: &mut Peer, piece_picker: &Arc<Mutex<PiecePicker>>, msg: Message) {
+    pub async fn handle_msg(
+        peer: &mut Peer,
+        piece_picker: &Arc<Mutex<PiecePicker>>,
+        msg: Message,
+    ) -> Result<()> {
         match msg.id {
-            MessageId::KeepAlive => (),
+            MessageId::KeepAlive => Ok(()),
             MessageId::BitField => {
                 peer.status.bitfield = BitField::from_payload(msg.payload);
                 if let Ok(mut picker) = piece_picker.lock() {
                     picker.add_peer_bitfield(&peer.status.bitfield);
                 } else {
                     error!("[!] Failed to lock the piece picker bitfield");
-                    return;
+                    bail!("[!] Failed to lock the piece picker bitfield");
                 }
                 if peer.send_msg(Message::interested()).await.is_err() {
                     error!(
                         "[!] Failed to send interested message to the peer: {:?}",
                         peer.to_string()
                     );
-                };
+                    bail!("[!] Failed to send interested message to the peer");
+                } else {
+                    Ok(())
+                }
             }
             MessageId::Choke => {
                 peer.status.choked = true;
+                Ok(())
             }
             MessageId::Unchoke => {
                 peer.status.choked = false;
@@ -165,14 +173,12 @@ impl Torrent {
                     block = picker.pick(&peer.status.bitfield);
                 } else {
                     error!("[!] Failed to lock the piece picker bitfield");
-                    return;
+                    bail!("[!] Failed to lock the piece picker bitfield");
                 }
 
                 if let Some(b) = block
                     && peer
-                        .send_msg(Message::request(
-                            b.to_payload().as_slice().try_into().unwrap(),
-                        ))
+                        .send_msg(Message::request(b.to_payload().as_slice().try_into()?))
                         .await
                         .is_err()
                 {
@@ -180,9 +186,26 @@ impl Torrent {
                         "[!] Failed to send request message to the peer: {:?}",
                         peer.to_string()
                     );
+                    bail!("[!] Failed to send request message to the peer");
+                } else {
+                    Ok(())
                 }
             }
-            _ => warn!("[-] Unrecognized message id received: {:?}", msg.id),
+            MessageId::Have => {
+                if let Ok(mut picker) = piece_picker.lock() {
+                    let index: usize = usize::from_be_bytes(msg.payload.as_slice().try_into()?);
+                    peer.status.bitfield.set_piece(index);
+                    picker.add_peer_have(index);
+                    Ok(())
+                } else {
+                    error!("[!] Failed to lock the piece picker bitfield");
+                    bail!("[!] Failed to lock the piece picker bitfield");
+                }
+            }
+            _ => {
+                warn!("[-] Unrecognized message id received: {:?}", msg.id);
+                Ok(())
+            }
         }
     }
 }

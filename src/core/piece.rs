@@ -61,7 +61,7 @@ pub struct Piece {
 
 impl Piece {
     pub fn new(index: usize, hash: [u8; 20], length: usize) -> Self {
-        let num_blocks = (length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let num_blocks = length.div_ceil(BLOCK_SIZE);
         let mut blocks = Vec::new();
 
         for i in 0..num_blocks {
@@ -80,7 +80,7 @@ impl Piece {
             status: PieceStatus::Missing,
             length,
             bitfield: BitField::new(),
-            blocks: blocks,
+            blocks,
             missing_blocks: num_blocks,
             data: vec![0; length],
         }
@@ -122,15 +122,15 @@ impl PiecePicker {
 
     pub fn pick(&mut self, bitfield: &BitField) -> Option<Block> {
         for piece in self.pieces.iter_mut() {
-            if piece.status == PieceStatus::Downloading && bitfield.has_piece(piece.index) {
-                if let Some(block) = piece
+            if piece.status == PieceStatus::Downloading
+                && bitfield.has_piece(piece.index)
+                && let Some(block) = piece
                     .blocks
                     .iter_mut()
                     .find(|b| b.status == BlockStatus::Free)
-                {
-                    block.status = BlockStatus::Requested;
-                    return Some(*block);
-                }
+            {
+                block.status = BlockStatus::Requested;
+                return Some(*block);
             }
         }
 
@@ -153,7 +153,7 @@ impl PiecePicker {
             .iter()
             .enumerate()
             .min_by_key(|&(_i, valore)| valore)
-            .unwrap_or((0 as usize, &0));
+            .unwrap_or((0usize, &0));
 
         let rarest_piece = &mut missing_pieces[rarest_index];
         rarest_piece.status = PieceStatus::Downloading;
@@ -164,9 +164,9 @@ impl PiecePicker {
             .find(|b| b.status == BlockStatus::Free)
         {
             block.status = BlockStatus::Requested;
-            return Some(*block);
+            Some(*block)
         } else {
-            return None;
+            None
         }
     }
 }
