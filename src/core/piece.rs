@@ -1,4 +1,11 @@
-use crate::core::bitfield::BitField;
+use crate::core::{bitfield::BitField, torrent_file::TorrentFile};
+use anyhow::Result;
+use sha1::{Digest, Sha1};
+use std::path::PathBuf;
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
+};
 
 const BLOCK_SIZE: usize = 16384;
 
@@ -25,15 +32,15 @@ impl Block {
             offset,
             length,
             status: BlockStatus::Free,
-            timer: 5,
+            timer: 30,
         }
     }
 
     pub fn to_payload(&self) -> Vec<u8> {
         [
-            self.piece_index.to_be_bytes(),
-            self.offset.to_be_bytes(),
-            self.length.to_be_bytes(),
+            (self.piece_index as u32).to_be_bytes(),
+            (self.offset as u32).to_be_bytes(),
+            (self.length as u32).to_be_bytes(),
         ]
         .concat()
     }
@@ -53,7 +60,6 @@ pub struct Piece {
     pub hash: [u8; 20],
     pub status: PieceStatus,
     pub length: usize,
-    pub bitfield: BitField,
     pub blocks: Vec<Block>,
     pub missing_blocks: usize,
     pub data: Vec<u8>,
@@ -79,11 +85,92 @@ impl Piece {
             hash,
             status: PieceStatus::Missing,
             length,
-            bitfield: BitField::new(),
             blocks,
             missing_blocks: num_blocks,
             data: vec![0; length],
         }
+    }
+
+    pub async fn write_to_disk(
+        index: usize,
+        data: &[u8],
+        file: &TorrentFile,
+        path: PathBuf,
+    ) -> Result<()> {
+        let piece_length = file.info.piece_length as usize;
+        let mut global_offset = index * piece_length;
+        let mut bytes_left = data.len();
+        let mut data_offset = 0;
+
+        let mut base_path = path.clone();
+        base_path.push(&file.info.name);
+
+        if let Some(files) = &file.info.files {
+            let mut current_file_start = 0;
+            for file in files {
+                let current_file_end = current_file_start + file.length;
+                if global_offset >= current_file_start
+                    && global_offset < current_file_end
+                    && bytes_left > 0
+                {
+                    let local_offset = global_offset - current_file_start;
+                    let bytes_to_write = bytes_left.min(file.length - local_offset);
+
+                    let mut file_path = base_path.clone();
+                    for d in &file.path {
+                        file_path.push(d);
+                    }
+
+                    if let Some(parent) = file_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+
+                    let mut file_handle = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&file_path)
+                        .await?;
+
+                    file_handle
+                        .seek(SeekFrom::Start(local_offset as u64))
+                        .await?;
+                    file_handle
+                        .write_all(&data[data_offset..data_offset + bytes_to_write])
+                        .await?;
+
+                    global_offset += bytes_to_write;
+                    data_offset += bytes_to_write;
+                    bytes_left -= bytes_to_write;
+                }
+                current_file_start = current_file_end;
+                if bytes_left == 0 {
+                    break;
+                }
+            }
+        } else {
+            if let Some(parent) = base_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            let mut file_handle = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&base_path)
+                .await?;
+
+            file_handle
+                .seek(SeekFrom::Start(global_offset as u64))
+                .await?;
+            file_handle.write_all(data).await?
+        }
+        Ok(())
+    }
+
+    pub fn verify(&mut self) -> bool {
+        let hash = Sha1::digest(&self.data);
+        hash == self.hash
     }
 }
 
@@ -167,6 +254,71 @@ impl PiecePicker {
             Some(*block)
         } else {
             None
+        }
+    }
+
+    pub fn handle_piece(&mut self, index: usize, offset: u32, data: &[u8]) -> Result<bool> {
+        let piece: &mut Piece = self
+            .pieces
+            .get_mut(index)
+            .ok_or(anyhow::anyhow!("Invalid piece index"))?;
+
+        let block_idx = offset as usize / BLOCK_SIZE;
+        if block_idx >= piece.blocks.len() {
+            return Err(anyhow::anyhow!("Invalid block offset"));
+        }
+        if piece.blocks[block_idx].status == BlockStatus::Downloaded {
+            return Ok(false);
+        }
+
+        let end_offset = offset as usize + data.len();
+        if end_offset > piece.data.len() {
+            return Err(anyhow::anyhow!("Piece data length overflow"));
+        }
+
+        piece.data[offset as usize..end_offset].copy_from_slice(data);
+
+        piece.missing_blocks -= 1;
+
+        piece.blocks[block_idx].status = BlockStatus::Downloaded;
+
+        if piece.missing_blocks == 0 {
+            piece.status = PieceStatus::Verifying;
+
+            return if piece.verify() {
+                piece.status = PieceStatus::Completed;
+                self.bitfield.set_piece(index);
+                self.missing_pieces -= 1;
+                Ok(true)
+            } else {
+                piece.data.fill(0);
+                piece.status = PieceStatus::Missing;
+                piece.missing_blocks = piece.blocks.len();
+                for block in &mut piece.blocks {
+                    block.status = BlockStatus::Free;
+                    block.timer = 30;
+                }
+                Ok(false)
+            };
+        }
+
+        Ok(false)
+    }
+
+    pub fn tick_timeouts(&mut self) {
+        for piece in &mut self.pieces {
+            if piece.status == PieceStatus::Downloading {
+                for block in &mut piece.blocks {
+                    if block.status == BlockStatus::Requested {
+                        if block.timer == 0 {
+                            block.status = BlockStatus::Free;
+                            block.timer = 30;
+                        } else {
+                            block.timer -= 1;
+                        }
+                    }
+                }
+            }
         }
     }
 }

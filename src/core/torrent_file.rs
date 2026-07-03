@@ -54,14 +54,16 @@ impl Info {
     }
 
     pub fn total_len(&self) -> Result<usize> {
-        if self.length.is_some() {
-            return Ok(self.length.unwrap());
-        } else if self.files.is_some() {
+        if let Some(length) = self.length {
+            Ok(length)
+        } else if let Some(files) = &self.files {
             let mut len: usize = 0;
-            let _ = self.files.clone().unwrap().iter().map(|f| len += f.length);
-            return Ok(len);
+            for file in files {
+                len += file.length;
+            }
+            Ok(len)
         } else {
-            return Err(anyhow!("[!] Both file length and files list are missing"));
+            Err(anyhow!("[!] Both file length and files list are missing"))
         }
     }
 }

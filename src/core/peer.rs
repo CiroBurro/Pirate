@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use std::net::Ipv4Addr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpSocket, TcpStream},
+    net::TcpStream,
 };
 use tracing::{info, instrument};
 
@@ -17,19 +17,18 @@ pub struct Peer {
 impl Peer {
     #[instrument(skip(info_hash, peer_id))]
     pub async fn handshake(&mut self, info_hash: &[u8; 20], peer_id: &[u8; 20]) -> Result<()> {
-        let mut handshake = PeerHandshake::default();
-        handshake.info_hash = *info_hash;
-        handshake.peer_id = *peer_id;
+        let handshake = PeerHandshake {
+            info_hash: *info_hash,
+            peer_id: *peer_id,
+            ..Default::default()
+        };
 
-        let socket = TcpSocket::new_v4().context("[!] Failed to create a new TCP socket")?;
-
-        let mut stream = socket
-            .connect(self.to_string().parse()?)
+        let mut stream = TcpStream::connect(self.to_string().parse::<std::net::SocketAddr>()?)
             .await
             .with_context(|| {
                 format!(
                     "[!] Failed to connect to the socket to the address: {}",
-                    self.to_string()
+                    self
                 )
             })?;
 
@@ -41,15 +40,15 @@ impl Peer {
             .with_context(|| {
                 format!(
                     "[!] Failed to send the handshale request to the peer: {}",
-                    self.to_string()
+                    self
                 )
             })?;
 
-        let mut buf = [0u8, 68];
+        let mut buf = [0u8; 68];
         stream.read_exact(&mut buf).await.with_context(|| {
             format!(
-                "Failed to read the handshake response from peer: {}",
-                self.to_string()
+                "[!] Failed to read the handshake response from peer: {}",
+                self
             )
         })?;
 
@@ -63,11 +62,11 @@ impl Peer {
             stream
                 .write_all(&message.serialize())
                 .await
-                .with_context(|| format!("Failed to send message to peer: {}", self.to_string()))?;
+                .with_context(|| format!("Failed to send message to peer: {}", self))?;
         } else {
             bail!(
                 "[!] Trying to send a message but there is no open stream with the peer: {}",
-                self.to_string()
+                self
             );
         }
 
@@ -80,7 +79,7 @@ impl Peer {
             stream
                 .read_exact(&mut buf_len)
                 .await
-                .context("Failed to read message length from peer")?;
+                .context("[!] Failed to read message length from peer")?;
 
             let len = u32::from_be_bytes(buf_len);
 
@@ -89,23 +88,24 @@ impl Peer {
             }
 
             let mut data = vec![0u8; len as usize];
-            stream.read_exact(&mut data).await.with_context(|| {
-                format!("Failed to read message from peer: {}", self.to_string())
-            })?;
+            stream
+                .read_exact(&mut data)
+                .await
+                .with_context(|| format!("[!] Failed to read message from peer: {}", self))?;
 
             Message::parse(len, data)
         } else {
             bail!(
                 "[!] Trying to read a message but there is no open stream with the peer: {}",
-                self.to_string()
+                self
             );
         }
     }
 }
 
-impl ToString for Peer {
-    fn to_string(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.ip, self.port)
     }
 }
 
@@ -129,7 +129,7 @@ impl PeerHandshake {
     fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(68);
 
-        buf.extend_from_slice(&19_i32.to_be_bytes());
+        buf.push(19u8);
         buf.extend_from_slice(self.pstr.as_bytes());
         buf.extend_from_slice(&[0_u8; 8]);
         buf.extend_from_slice(&self.info_hash);
@@ -139,19 +139,9 @@ impl PeerHandshake {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PeerStatus {
     pub choked: bool,
     pub stream: Option<TcpStream>,
     pub bitfield: BitField,
-}
-
-impl Default for PeerStatus {
-    fn default() -> Self {
-        Self {
-            choked: false,
-            stream: None,
-            bitfield: BitField::new(),
-        }
-    }
 }

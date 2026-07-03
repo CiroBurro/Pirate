@@ -3,13 +3,19 @@ pub struct BitField {
     pub data: Vec<u8>,
 }
 
+impl Default for BitField {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BitField {
     pub fn new() -> Self {
         Self { data: Vec::new() }
     }
 
     pub fn with_pieces(num_pieces: usize) -> Self {
-        let num_bytes = (num_pieces + 7) / 8;
+        let num_bytes = num_pieces.div_ceil(8);
         Self {
             data: vec![0; num_bytes],
         }
@@ -27,7 +33,7 @@ impl BitField {
             return false;
         }
 
-        self.data[byte_index] >> (7 - offset as usize) & 1 != 0
+        self.data[byte_index] >> (7 - offset) & 1 != 0
     }
 
     pub fn set_piece(&mut self, index: usize) {
@@ -38,6 +44,6 @@ impl BitField {
             return;
         }
 
-        self.data[byte_index] |= 1 << (7 - offset as usize)
+        self.data[byte_index] |= 1 << (7 - offset)
     }
 }
