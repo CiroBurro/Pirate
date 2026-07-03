@@ -180,6 +180,7 @@ pub struct PiecePicker {
     pub bitfield: BitField,
     pub piece_frequencies: Vec<usize>,
     pub missing_pieces: usize,
+    pub paused: bool,
 }
 
 impl PiecePicker {
@@ -190,6 +191,7 @@ impl PiecePicker {
             bitfield: BitField::with_pieces(num_pieces),
             piece_frequencies: vec![0; num_pieces],
             missing_pieces: num_pieces,
+            paused: false,
         }
     }
 
@@ -208,6 +210,9 @@ impl PiecePicker {
     }
 
     pub fn pick(&mut self, bitfield: &BitField) -> Option<Block> {
+        if self.paused {
+            return None;
+        }
         for piece in self.pieces.iter_mut() {
             if piece.status == PieceStatus::Downloading
                 && bitfield.has_piece(piece.index)

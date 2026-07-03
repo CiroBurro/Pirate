@@ -2,21 +2,12 @@ use crate::core::{
     peer::{Peer, PeerStatus},
     torrent::Torrent,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
 use tracing::{info, instrument, warn};
 
-#[instrument(skip(torrent))]
-pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
-    let info_hash = torrent.info_hash;
-    let peer_id = torrent.peer_id;
-    let left_len = torrent
-        .file
-        .info
-        .total_len()
-        .context("[!] Failed to get the total length of the files to download")?;
-
+fn read_trackers(torrent: &Torrent) -> Vec<String> {
     let mut trackers = vec![torrent.file.announce.clone()];
 
     if let Some(announce_list) = &torrent.file.announce_list {
@@ -28,6 +19,20 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
             }
         }
     }
+    trackers
+}
+
+#[instrument(skip(torrent))]
+pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
+    let info_hash = torrent.info_hash;
+    let peer_id = torrent.peer_id;
+    let left_len = torrent
+        .file
+        .info
+        .total_len()
+        .context("[!] Failed to get the total length of the files to download")?;
+
+    let trackers = read_trackers(torrent);
 
     info!(
         "Found {} trackers inside the announce list.",
@@ -37,7 +42,7 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
     let mut set = JoinSet::new();
     for tracker_url in trackers {
         set.spawn(
-            async move { tracker_handshake(tracker_url, info_hash, peer_id, left_len).await },
+            async move { tracker_handshake(tracker_url, info_hash, peer_id, left_len, 0).await },
         );
     }
 
@@ -59,12 +64,31 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
     bail!("[!] All trackers failed");
 }
 
+#[instrument(skip(torrent))]
+pub async fn complete_msg(torrent: &Torrent) {
+    let info_hash = torrent.info_hash;
+    let peer_id = torrent.peer_id;
+    let left_len = 0;
+
+    let trackers = read_trackers(torrent);
+
+    let mut set = JoinSet::new();
+    for tracker_url in trackers {
+        set.spawn(
+            async move { tracker_handshake(tracker_url, info_hash, peer_id, left_len, 1).await },
+        );
+    }
+
+    set.join_all().await;
+}
+
 #[instrument(skip(info_hash, peer_id, left_len))]
 pub async fn tracker_handshake(
     url: String,
     info_hash: [u8; 20],
     peer_id: [u8; 20],
     left_len: usize,
+    event: u32,
 ) -> Result<Vec<Peer>> {
     if !url.starts_with("udp://") {
         bail!("[!] The tracker's url must start with 'udp://'");
@@ -110,7 +134,8 @@ pub async fn tracker_handshake(
 
     let connection_id = &res[8..16];
     let connection_id = i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
-    let announce_req = AnnounceRequest::new(connection_id, info_hash, peer_id, left_len as i64);
+    let announce_req =
+        AnnounceRequest::new(connection_id, info_hash, peer_id, left_len as i64, event);
 
     socket
         .send(&announce_req.serialize())
@@ -120,11 +145,7 @@ pub async fn tracker_handshake(
         })?;
 
     let mut peer_res = vec![0u8; 1024];
-    let size = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        socket.recv(&mut peer_res),
-    )
-    .await
+    let size = match tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut peer_res)).await
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
@@ -189,7 +210,13 @@ struct AnnounceRequest {
 }
 
 impl AnnounceRequest {
-    fn new(connection_id: i64, info_hash: [u8; 20], peer_id: [u8; 20], left: i64) -> Self {
+    fn new(
+        connection_id: i64,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        left: i64,
+        event: u32,
+    ) -> Self {
         Self {
             connection_id,
             action: 1,
@@ -199,7 +226,7 @@ impl AnnounceRequest {
             downloaded: 0,
             left,
             uploaded: 0,
-            event: 0,
+            event,
             ip_address: 0,
             key: 0,
             num_want: -1,

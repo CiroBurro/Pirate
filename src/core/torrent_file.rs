@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_bencode::de;
 use serde_bytes::ByteBuf;
@@ -32,7 +32,7 @@ impl TorrentFile {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
     #[serde(rename = "piece length")]
-    pub piece_length: i32,
+    pub piece_length: u32,
     pub pieces: ByteBuf,
     pub name: String,
     pub length: Option<usize>,
