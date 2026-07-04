@@ -1,5 +1,5 @@
 use crate::core::{bitfield::BitField, message::Message};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::net::Ipv4Addr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -141,7 +141,27 @@ impl PeerHandshake {
 
 #[derive(Debug, Default)]
 pub struct PeerStatus {
-    pub choked: bool,
+    pub am_choked: bool,
     pub stream: Option<TcpStream>,
     pub bitfield: BitField,
+}
+
+#[derive(Copy, Clone)]
+pub struct SharedPeerCtrl {
+    pub am_choking: bool,
+    pub peer_interested: bool,
+}
+
+impl Default for SharedPeerCtrl {
+    fn default() -> Self {
+        Self {
+            am_choking: true,
+            peer_interested: false,
+        }
+    }
+}
+
+pub enum PeerCommand {
+    Choke,
+    Unchoke,
 }

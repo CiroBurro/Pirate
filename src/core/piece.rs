@@ -168,6 +168,16 @@ impl Piece {
         Ok(())
     }
 
+    pub async fn read_from_disk(
+        index: usize,
+        offset: u32,
+        length: u32,
+        file: &TorrentFile,
+        path: PathBuf,
+    ) -> Result<Piece> {
+        todo!()
+    }
+
     pub fn verify(&mut self) -> bool {
         let hash = Sha1::digest(&self.data);
         hash == self.hash

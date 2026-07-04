@@ -1,4 +1,5 @@
 use crate::client::{ClientEvent, Config};
+use crate::core::peer::{PeerCommand, PeerStatus, SharedPeerCtrl};
 use crate::core::{
     bitfield::BitField,
     message::{Message, MessageId},
@@ -151,21 +152,35 @@ impl Torrent {
         }
         info!("Found {} active peers", self.peers.len());
 
-        for peer in std::mem::take(&mut self.peers) {
+        let mut txs: Vec<mpsc::Sender<PeerCommand>> = Vec::with_capacity(self.peers.len());
+
+        let control: Arc<Mutex<Vec<SharedPeerCtrl>>> = Arc::new(Mutex::new(vec![
+                SharedPeerCtrl::default();
+                self.peers.len()
+            ]));
+
+        for (i, peer) in std::mem::take(&mut self.peers).into_iter().enumerate() {
             let piece_picker = Arc::clone(&self.piece_picker);
             let file = Arc::clone(&self.file);
+            let (tx, rx) = mpsc::channel::<PeerCommand>(16);
+            txs.push(tx);
             tokio::task::spawn(Self::peer_loop(
                 peer,
+                control.clone(),
+                i,
                 piece_picker,
                 file,
                 download_dir.clone(),
                 event_tx.clone(),
                 info.write().await.id,
+                rx,
             ));
         }
 
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
 
         let mut prev_downloaded: f64 = 0.0;
         loop {
@@ -235,6 +250,15 @@ impl Torrent {
                         upload_rate: i.upload_rate,
                     })?;
                 }
+
+                _ = timer.tick() => {
+                    let unchokes = Self::recalc_unchoke(control.clone());
+
+                    for (u, tx) in unchokes.iter().zip(&txs) {
+                        let cmd = if *u { PeerCommand::Unchoke } else { PeerCommand::Choke };
+                        let _ = tx.send(cmd).await;
+                    }
+                }
             }
         }
         Ok(())
@@ -243,29 +267,23 @@ impl Torrent {
     #[instrument(skip_all)]
     async fn peer_loop(
         mut peer: Peer,
+        peer_ctrl: Arc<Mutex<Vec<SharedPeerCtrl>>>,
+        peer_index: usize,
         piece_picker: Arc<Mutex<PiecePicker>>,
         file: Arc<TorrentFile>,
         path: PathBuf,
         event_tx: Sender<ClientEvent>,
         id: TorrentId,
+        mut peer_cmd_rx: Receiver<PeerCommand>,
     ) -> Result<()> {
         loop {
-            let readable = if let Some(stream) = peer.status.stream.as_ref() {
-                tokio::time::timeout(std::time::Duration::from_secs(5), stream.readable()).await
-            } else {
-                event_tx.send(ClientEvent::Error {
-                    id,
-                    message: String::from("No stream"),
-                })?;
-                return Err(anyhow::anyhow!("No stream"));
-            };
-
-            match readable {
-                Ok(Ok(_)) => {
-                    let msg_result = peer.read_msg().await;
+            tokio::select! {
+                msg_result = Self::read_msg(&mut peer, Arc::clone(&piece_picker), event_tx.clone(), id) => {
                     if let Ok(msg) = msg_result {
                         if Self::handle_msg(
                             &mut peer,
+                            peer_ctrl.clone(),
+                            peer_index,
                             &piece_picker,
                             msg,
                             file.clone(),
@@ -282,37 +300,69 @@ impl Torrent {
                         error!("[!] Connection lost with {}: {}", peer, e);
                         event_tx.send(ClientEvent::Error {
                             id,
-                            message: format!("Connection lost with {}: {}", peer, e),
+                            message: format!("[!] Connection lost with {}: {}", peer, e),
                         })?;
                         return Err(e);
                     }
                 }
-                Ok(Err(e)) => {
-                    error!("[!] Stream error with {}: {}", peer, e);
-
-                    event_tx.send(ClientEvent::Error {
-                        id,
-                        message: format!("[!] Stream error with {}: {}", peer, e),
-                    })?;
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    if !peer.status.choked {
-                        let block = piece_picker.lock().await.pick(&peer.status.bitfield);
-                        if let Some(b) = block {
-                            let _ = peer
-                                .send_msg(Message::request(b.to_payload().as_slice().try_into()?))
-                                .await;
-                        }
-                    }
+                peer_cmd = peer_cmd_rx.recv() => {
+                    match peer_cmd {
+                        Some(PeerCommand::Choke) => peer.send_msg(Message::choke()),
+                        Some(PeerCommand::Unchoke) => peer.send_msg(Message::unchoke()),
+                        None => continue,
+                    }.await?;
                 }
             }
         }
     }
 
-    #[instrument(skip_all)]
-    pub async fn handle_msg(
+    async fn read_msg(
         peer: &mut Peer,
+        piece_picker: Arc<Mutex<PiecePicker>>,
+        event_tx: Sender<ClientEvent>,
+        id: TorrentId,
+    ) -> Result<Message> {
+        let readable = if let Some(stream) = peer.status.stream.as_ref() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.readable()).await
+        } else {
+            event_tx.send(ClientEvent::Error {
+                id,
+                message: String::from("No readable stream"),
+            })?;
+            debug!("No readable stream");
+            return Err(anyhow::anyhow!("No readable stream"));
+        };
+
+        match readable {
+            Ok(Ok(_)) => peer.read_msg().await,
+            Ok(Err(e)) => {
+                error!("[!] Stream error with {}: {}", peer, e);
+
+                event_tx.send(ClientEvent::Error {
+                    id,
+                    message: format!("[!] Stream error with {}: {}", peer, e),
+                })?;
+                Err(e.into())
+            }
+            Err(e) => {
+                if !peer.status.am_choked {
+                    let block = piece_picker.lock().await.pick(&peer.status.bitfield);
+                    if let Some(b) = block {
+                        let _ = peer
+                            .send_msg(Message::request(b.to_payload().as_slice().try_into()?))
+                            .await;
+                    }
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn handle_msg(
+        peer: &mut Peer,
+        peer_ctrl: Arc<Mutex<Vec<SharedPeerCtrl>>>,
+        peer_index: usize,
         piece_picker: &Arc<Mutex<PiecePicker>>,
         msg: Message,
         file: Arc<TorrentFile>,
@@ -320,7 +370,7 @@ impl Torrent {
         event_tx: Sender<ClientEvent>,
         id: TorrentId,
     ) -> Result<usize> {
-        let finished;
+        let mut finished = piece_picker.lock().await.missing_pieces == 0;
         match msg.id {
             MessageId::KeepAlive => Ok(0),
             MessageId::BitField => {
@@ -344,11 +394,11 @@ impl Torrent {
                 }
             }
             MessageId::Choke => {
-                peer.status.choked = true;
+                peer.status.am_choked = true;
                 Ok(0)
             }
             MessageId::Unchoke => {
-                peer.status.choked = false;
+                peer.status.am_choked = false;
                 let block = piece_picker.lock().await.pick(&peer.status.bitfield);
                 if let Some(b) = block
                     && peer
@@ -410,6 +460,37 @@ impl Torrent {
                 }
                 Ok(0)
             }
+            MessageId::NotInterested => {
+                peer_ctrl.lock().await[peer_index].peer_interested = false;
+                Ok(0)
+            }
+            MessageId::Interested => {
+                peer_ctrl.lock().await[peer_index].peer_interested = true;
+                Ok(0)
+            }
+            MessageId::Request => {
+                if peer_ctrl.lock().await[peer_index].am_choking {
+                    return Ok(0);
+                }
+
+                let index = u32::from_be_bytes(msg.payload[0..4].try_into()?) as usize;
+                let offset = u32::from_be_bytes(msg.payload[4..8].try_into()?);
+                let length = u32::from_be_bytes(msg.payload[8..].try_into()?);
+
+                if !piece_picker.lock().await.bitfield.has_piece(index) {
+                    return Ok(0);
+                }
+                if offset + length > file.info.piece_length {
+                    return Ok(0);
+                }
+
+                let mut piece = Piece::read_from_disk(index, offset, length, &file, path).await?;
+
+                let mut data: Vec<u8> = msg.payload[0..8].to_vec();
+                data.append(&mut piece.data);
+                peer.send_msg(Message::piece(data)).await?;
+                Ok(0)
+            }
             _ => {
                 warn!(
                     "[-] Unrecognized message id received: {:?}, closing connection",
@@ -418,6 +499,10 @@ impl Torrent {
                 Ok(1) // 1 to indicate the connection should be closed
             }
         }
+    }
+
+    fn recalc_unchoke(state: Arc<Mutex<Vec<SharedPeerCtrl>>>) -> Vec<bool> {
+        Vec::new()
     }
 }
 
