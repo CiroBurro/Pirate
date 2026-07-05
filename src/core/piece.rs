@@ -2,6 +2,7 @@ use crate::core::{bitfield::BitField, torrent_file::TorrentFile};
 use anyhow::Result;
 use sha1::{Digest, Sha1};
 use std::path::PathBuf;
+use tokio::io::AsyncReadExt;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
@@ -174,8 +175,54 @@ impl Piece {
         length: u32,
         file: &TorrentFile,
         path: PathBuf,
-    ) -> Result<Piece> {
-        todo!()
+    ) -> Result<Vec<u8>> {
+        let piece_length = file.info.piece_length as usize;
+        let mut global_offset = index * piece_length + offset as usize;
+        let mut bytes_left = length as usize;
+
+        let mut base_path = path.clone();
+        base_path.push(&file.info.name);
+
+        let mut result: Vec<u8> = Vec::with_capacity(length as usize);
+
+        if let Some(files) = &file.info.files {
+            let mut current_file_start = 0;
+            for file in files {
+                let current_file_end = current_file_start + file.length;
+                if global_offset >= current_file_start
+                    && global_offset < current_file_end
+                    && bytes_left > 0
+                {
+                    let local_offset = global_offset - current_file_start;
+                    let bytes_to_read = bytes_left.min(file.length - local_offset);
+                    let mut buffer = vec![0; bytes_to_read];
+                    let mut file_path = base_path.clone();
+                    for d in &file.path {
+                        file_path.push(d);
+                    }
+
+                    let mut file_handle = OpenOptions::new().read(true).open(&file_path).await?;
+                    file_handle
+                        .seek(SeekFrom::Start(local_offset as u64))
+                        .await?;
+                    file_handle.read_exact(&mut buffer).await?;
+                    result.extend_from_slice(&buffer);
+
+                    global_offset += bytes_to_read;
+                    bytes_left -= bytes_to_read;
+                }
+                current_file_start = current_file_end;
+            }
+        } else {
+            let mut buffer = vec![0; length as usize];
+            let mut file_handle = OpenOptions::new().read(true).open(&base_path).await?;
+            file_handle
+                .seek(SeekFrom::Start(global_offset as u64))
+                .await?;
+            file_handle.read_exact(&mut buffer).await?;
+            result.extend_from_slice(&buffer);
+        }
+        Ok(result)
     }
 
     pub fn verify(&mut self) -> bool {

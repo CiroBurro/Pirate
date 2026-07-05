@@ -1,5 +1,5 @@
 use crate::client::{ClientEvent, Config};
-use crate::core::peer::{PeerCommand, PeerStatus, SharedPeerCtrl};
+use crate::core::peer::{PeerCommand, SharedPeerCtrl};
 use crate::core::{
     bitfield::BitField,
     message::{Message, MessageId},
@@ -280,7 +280,7 @@ impl Torrent {
             tokio::select! {
                 msg_result = Self::read_msg(&mut peer, Arc::clone(&piece_picker), event_tx.clone(), id) => {
                     if let Ok(msg) = msg_result {
-                        if Self::handle_msg(
+                        match Self::handle_msg(
                             &mut peer,
                             peer_ctrl.clone(),
                             peer_index,
@@ -288,14 +288,19 @@ impl Torrent {
                             msg,
                             file.clone(),
                             path.clone(),
-                            event_tx.clone(),
-                            id,
-                        )
-                        .await?
-                            == 1
-                        {
-                            return Ok(());
+                        ).await {
+                            Ok(0) => continue,
+                            Ok(_) => return Ok(()), // Connection should be closed if exit code != 0
+                            Err(e) => {
+                                error!("[!] Error in handle_msg with {}: {}", peer, e);
+                                event_tx.send(ClientEvent::Error {
+                                    id,
+                                    message: format!("[!] Error in handle_msg with {}: {}", peer, e),
+                                })?;
+                                return Err(e);
+                            }
                         }
+
                     } else if let Err(e) = msg_result {
                         error!("[!] Connection lost with {}: {}", peer, e);
                         event_tx.send(ClientEvent::Error {
@@ -367,10 +372,7 @@ impl Torrent {
         msg: Message,
         file: Arc<TorrentFile>,
         path: PathBuf,
-        event_tx: Sender<ClientEvent>,
-        id: TorrentId,
     ) -> Result<usize> {
-        let mut finished = piece_picker.lock().await.missing_pieces == 0;
         match msg.id {
             MessageId::KeepAlive => Ok(0),
             MessageId::BitField => {
@@ -379,19 +381,10 @@ impl Torrent {
                     .lock()
                     .await
                     .add_peer_bitfield(&peer.status.bitfield);
-                if peer.send_msg(Message::interested()).await.is_err() {
-                    error!(
-                        "[!] Failed to send interested message to the peer: {:?}",
-                        peer.to_string()
-                    );
-                    event_tx.send(ClientEvent::Error {
-                        id,
-                        message: String::from("[!] Failed to send interested message to the peer"),
-                    })?;
-                    bail!("[!] Failed to send interested message to the peer");
-                } else {
-                    Ok(0)
-                }
+                peer.send_msg(Message::interested())
+                    .await
+                    .context("[!] Failed to send interested message to the peer")?;
+                Ok(0)
             }
             MessageId::Choke => {
                 peer.status.am_choked = true;
@@ -400,24 +393,14 @@ impl Torrent {
             MessageId::Unchoke => {
                 peer.status.am_choked = false;
                 let block = piece_picker.lock().await.pick(&peer.status.bitfield);
-                if let Some(b) = block
-                    && peer
-                        .send_msg(Message::request(b.to_payload().as_slice().try_into()?))
+                if let Some(b) = block {
+                    peer.send_msg(Message::request(b.to_payload().as_slice().try_into()?))
                         .await
-                        .is_err()
-                {
-                    error!(
-                        "[!] Failed to send request message to the peer: {:?}",
-                        peer.to_string()
-                    );
-                    event_tx.send(ClientEvent::Error {
-                        id,
-                        message: String::from("[!] Failed to send request message to the peer"),
-                    })?;
-                    bail!("[!] Failed to send request message to the peer");
+                        .context("[!] Failed to send request message to the peer")?;
                 } else {
-                    Ok(0)
+                    debug!("No block picked");
                 }
+                Ok(0)
             }
             MessageId::Have => {
                 let index: u32 = u32::from_be_bytes(msg.payload[..4].try_into()?);
@@ -435,8 +418,6 @@ impl Torrent {
                     .handle_piece(index, offset, block_data)
                     .context("[!] Failed to handle piece data received")?;
 
-                finished = picker.missing_pieces == 0;
-
                 let data_to_save = if piece_ready {
                     Some((index, std::mem::take(&mut picker.pieces[index].data)))
                 } else {
@@ -446,17 +427,15 @@ impl Torrent {
                 let (next_block, piece_data) = (picker.pick(&peer.status.bitfield), data_to_save);
 
                 if let Some((piece_index, data)) = piece_data {
-                    Piece::write_to_disk(piece_index, &data, &file, path).await?;
-                }
-
-                if finished {
-                    event_tx.send(ClientEvent::PieceCompleted { id, index })?;
-                    return Ok(1);
+                    Piece::write_to_disk(piece_index, &data, &file, path)
+                        .await
+                        .context("[!] Failed to write received block to disk, retrying...")?;
                 }
 
                 if let Some(b) = next_block {
                     peer.send_msg(Message::request(b.to_payload().as_slice().try_into()?))
-                        .await?;
+                        .await
+                        .context("[!] Failed to send next block request message to the peer")?;
                 }
                 Ok(0)
             }
@@ -484,11 +463,15 @@ impl Torrent {
                     return Ok(0);
                 }
 
-                let mut piece = Piece::read_from_disk(index, offset, length, &file, path).await?;
+                let mut piece_data = Piece::read_from_disk(index, offset, length, &file, path)
+                    .await
+                    .context("[!] Failed to read piece from disk")?;
 
                 let mut data: Vec<u8> = msg.payload[0..8].to_vec();
-                data.append(&mut piece.data);
-                peer.send_msg(Message::piece(data)).await?;
+                data.append(&mut piece_data);
+                peer.send_msg(Message::piece(data))
+                    .await
+                    .context("[!] Failed to send piece to the peer")?;
                 Ok(0)
             }
             _ => {
@@ -496,7 +479,7 @@ impl Torrent {
                     "[-] Unrecognized message id received: {:?}, closing connection",
                     msg.id
                 );
-                Ok(1) // 1 to indicate the connection should be closed
+                Ok(1) // 1 to indicate the connection should be closed silently
             }
         }
     }
