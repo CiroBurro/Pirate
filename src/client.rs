@@ -3,8 +3,13 @@ use crate::core::torrent::{
 };
 use crate::core::torrent_file::TorrentFile;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tracing::{error, info};
 
 #[derive(Clone, Debug)]
 pub enum ClientEvent {
@@ -67,6 +72,7 @@ impl Default for Config {
 pub struct Client {
     config: Config,
     torrents: Vec<TorrentHandle>,
+    info_hash_map: Arc<Mutex<HashMap<[u8; 20], mpsc::Sender<TorrentCommand>>>>,
     next_id: TorrentId,
     event_tx: broadcast::Sender<ClientEvent>,
 }
@@ -77,6 +83,7 @@ impl Client {
         Self {
             config,
             torrents: Vec::new(),
+            info_hash_map: Arc::new(Mutex::new(HashMap::new())),
             next_id: 1,
             event_tx,
         }
@@ -89,6 +96,7 @@ impl Client {
     pub async fn add_torrent(&mut self, path: PathBuf) -> Result<TorrentId> {
         let torrent_file = TorrentFile::from_file(path).await?;
         let torrent = Torrent::new(torrent_file, self.config.peer_id).await?;
+        let info_hash = torrent.info_hash;
         let id = self.next_id;
         self.next_id += 1;
         let handle = torrent.spawn(id, &self.config, self.event_tx.clone())?;
@@ -96,6 +104,10 @@ impl Client {
             id,
             name: handle.info.read().await.name.clone(),
         });
+        self.info_hash_map
+            .lock()
+            .await
+            .insert(info_hash, handle.ctrl_tx.clone());
         self.torrents.push(handle);
         Ok(id)
     }
@@ -131,7 +143,9 @@ impl Client {
     pub async fn remove(&mut self, id: TorrentId) {
         if let Some(pos) = self.torrents.iter().position(|h| h.id == id) {
             let handle = self.torrents.remove(pos);
+            let info_hash = handle.info.read().await.info_hash;
             let _ = handle.ctrl_tx.send(TorrentCommand::Cancel).await;
+            self.info_hash_map.lock().await.remove(&info_hash);
             self.emit(ClientEvent::TorrentRemoved(id));
         }
     }
@@ -150,5 +164,34 @@ impl Client {
 
     fn emit(&self, event: ClientEvent) {
         let _ = self.event_tx.send(event);
+    }
+    async fn start_listener(&self) -> Result<()> {
+        let map = self.info_hash_map.clone();
+        let listener = TcpListener::bind(("0.0.0.0", self.config.listen_port)).await?;
+
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, addr)) => {
+                        info!("Incoming connection from {}", addr);
+                        let mut buf = [0u8; 68];
+                        if stream.read_exact(&mut buf).await.is_err() {
+                            continue;
+                        }
+                        let info_hash: [u8; 20] = match buf[28..48].try_into() {
+                            Ok(h) => h,
+                            Err(_) => continue,
+                        };
+                        if let Some(tx) = map.lock().await.get(&info_hash) {
+                            let _ = tx.send(TorrentCommand::NewPeer(stream)).await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Accept failed: {}", e);
+                    }
+                }
+            }
+        });
+        Ok(())
     }
 }

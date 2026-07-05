@@ -3,6 +3,7 @@ use crate::core::{
     torrent::Torrent,
 };
 use anyhow::{bail, Context, Result};
+use std::net::IpAddr;
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
 use tracing::{info, instrument, warn};
@@ -275,11 +276,7 @@ impl AnnounceResponse {
 
         for chunk in slice[20..].chunks_exact(6) {
             peers.push(Peer {
-                ip: Ipv4Addr::from_octets(
-                    chunk[0..4]
-                        .try_into()
-                        .context("[!] Failed to convert ip address bytes into Ipv4Addr struct")?,
-                ),
+                ip: IpAddr::V4(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3])),
                 port: u16::from_be_bytes(
                     chunk[4..]
                         .try_into()

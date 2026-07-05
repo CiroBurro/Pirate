@@ -1,6 +1,6 @@
 use crate::core::{bitfield::BitField, message::Message};
 use anyhow::{bail, Context, Result};
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -9,12 +9,26 @@ use tracing::{info, instrument};
 
 #[derive(Debug)]
 pub struct Peer {
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
     pub port: u16,
     pub status: PeerStatus,
 }
 
 impl Peer {
+    pub fn from_stream(stream: TcpStream) -> Result<Self> {
+        let addr = stream.peer_addr()?;
+        let status = PeerStatus {
+            am_choked: true,
+            stream: Some(stream),
+            bitfield: BitField::default(),
+        };
+        Ok(Self {
+            ip: addr.ip(),
+            port: addr.port(),
+            status,
+        })
+    }
+
     #[instrument(skip(info_hash, peer_id))]
     pub async fn handshake(&mut self, info_hash: &[u8; 20], peer_id: &[u8; 20]) -> Result<()> {
         let handshake = PeerHandshake {
@@ -39,7 +53,7 @@ impl Peer {
             .await
             .with_context(|| {
                 format!(
-                    "[!] Failed to send the handshale request to the peer: {}",
+                    "[!] Failed to send the handshake request to the peer: {}",
                     self
                 )
             })?;
@@ -109,10 +123,10 @@ impl std::fmt::Display for Peer {
     }
 }
 
-struct PeerHandshake {
+pub struct PeerHandshake {
     pstr: String,
-    info_hash: [u8; 20],
-    peer_id: [u8; 20],
+    pub info_hash: [u8; 20],
+    pub peer_id: [u8; 20],
 }
 
 impl Default for PeerHandshake {
@@ -126,7 +140,7 @@ impl Default for PeerHandshake {
 }
 
 impl PeerHandshake {
-    fn serialize(&self) -> Vec<u8> {
+    pub(crate) fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(68);
 
         buf.push(19u8);

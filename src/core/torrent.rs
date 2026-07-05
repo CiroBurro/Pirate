@@ -1,5 +1,5 @@
 use crate::client::{ClientEvent, Config};
-use crate::core::peer::{PeerCommand, SharedPeerCtrl};
+use crate::core::peer::{PeerCommand, PeerHandshake, SharedPeerCtrl};
 use crate::core::{
     bitfield::BitField,
     message::{Message, MessageId},
@@ -10,6 +10,8 @@ use crate::core::{
 };
 use anyhow::{bail, Context, Result};
 use std::{path::PathBuf, sync::Arc};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -172,7 +174,7 @@ impl Torrent {
                 file,
                 download_dir.clone(),
                 event_tx.clone(),
-                info.write().await.id,
+                info.read().await.id,
                 rx,
             ));
         }
@@ -221,6 +223,38 @@ impl Torrent {
                             break;
                         },
                         Some(TorrentCommand::Cancel) => break,
+                        Some(TorrentCommand::NewPeer(mut stream)) => {
+                            let mut handshake = PeerHandshake::default();
+                            handshake.info_hash = self.info_hash;
+                            handshake.peer_id = self.peer_id;
+
+                            stream.writable().await?;
+
+                            stream
+                                .write_all(&handshake.serialize())
+                                .await
+                                .context("[!] Failed to send the handshake to the peer")?;
+
+                            let peer = Peer::from_stream(stream)?;
+                            let (tx, rx) = mpsc::channel::<PeerCommand>(16);
+                            txs.push(tx);
+
+                            let mut ctrl = control.lock().await;
+                            ctrl.push(SharedPeerCtrl::default());
+                            let i = ctrl.len() - 1;
+                            drop(ctrl);
+                            tokio::task::spawn(Self::peer_loop(
+                                peer,
+                                control.clone(),
+                                i,
+                                self.piece_picker.clone(),
+                                self.file.clone(),
+                                download_dir.clone(),
+                                event_tx.clone(),
+                                info.read().await.id,
+                                rx,
+                            ));
+                        }
                         None => break
                     }
                 }
@@ -229,11 +263,9 @@ impl Torrent {
                     let mut picker = self.piece_picker.lock().await;
                     let mut i = info.write().await;
                     if picker.missing_pieces == 0 {
-                        info!("[*] Download complete");
-                        i.state = TorrentState::Completed;
-                        drop(i);
+                        info!("[*] Download complete - now seeding");
+                        i.state = TorrentState::Seeding;
                         complete_msg(&self).await;
-                        break
                     }
                     picker.tick_timeouts();
 
@@ -497,7 +529,7 @@ impl Torrent {
             .iter_mut()
             .enumerate()
             .filter(|(_, p)| p.peer_interested)
-            .map(|(i, mut p)| {
+            .map(|(i, p)| {
                 let rate = (p.uploaded - p.uploaded_prev) as f64;
                 p.uploaded_prev = p.uploaded;
                 (i, rate)
@@ -530,6 +562,7 @@ pub enum TorrentState {
 pub struct TorrentInfo {
     pub id: TorrentId,
     pub name: String,
+    pub info_hash: [u8; 20],
     pub total_size: u64,
     pub downloaded: u64,
     pub uploaded: u64,
@@ -544,6 +577,7 @@ impl TorrentInfo {
         Ok(Self {
             id,
             name: torrent.file.info.name.clone(),
+            info_hash: torrent.info_hash,
             total_size: torrent.file.info.total_len()? as u64,
             downloaded: 0,
             uploaded: 0,
@@ -560,6 +594,7 @@ pub enum TorrentCommand {
     Resume,
     Stop,
     Cancel,
+    NewPeer(TcpStream),
 }
 
 pub struct TorrentHandle {
