@@ -2,7 +2,6 @@ pub mod client;
 pub mod core;
 
 use client::{Client, ClientEvent, Config};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -12,7 +11,7 @@ use tracing_subscriber::{self, EnvFilter};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_file(true)
         .with_line_number(true)

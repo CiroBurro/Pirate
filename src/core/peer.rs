@@ -150,6 +150,8 @@ pub struct PeerStatus {
 pub struct SharedPeerCtrl {
     pub am_choking: bool,
     pub peer_interested: bool,
+    pub uploaded: u64,
+    pub uploaded_prev: u64,
 }
 
 impl Default for SharedPeerCtrl {
@@ -157,6 +159,8 @@ impl Default for SharedPeerCtrl {
         Self {
             am_choking: true,
             peer_interested: false,
+            uploaded: 0,
+            uploaded_prev: 0,
         }
     }
 }

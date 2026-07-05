@@ -183,6 +183,7 @@ impl Torrent {
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
 
         let mut prev_downloaded: f64 = 0.0;
+        let mut prev_uploaded: f64 = 0.0;
         loop {
             tokio::select! {
                 cmd = ctrl_rx.recv() => {
@@ -241,7 +242,12 @@ impl Torrent {
                     let downloaded_pieces = total_pieces - picker.missing_pieces;
                     i.progress = downloaded_pieces as f64 * 100.0 / total_pieces as f64;
                     i.download_rate = i.downloaded as f64 - prev_downloaded;
+                    i.uploaded = control.lock().await.iter().map(|p| p.uploaded).sum();
+                    i.upload_rate = i.uploaded as f64 - prev_uploaded;
+
                     prev_downloaded = i.downloaded as f64;
+                    prev_uploaded = i.uploaded as f64;
+
                     event_tx.send(ClientEvent::Progress {
                         id: i.id,
                         progress: i.progress,
@@ -252,7 +258,7 @@ impl Torrent {
                 }
 
                 _ = timer.tick() => {
-                    let unchokes = Self::recalc_unchoke(control.clone());
+                    let unchokes = Self::recalc_unchoke(control.clone()).await;
 
                     for (u, tx) in unchokes.iter().zip(&txs) {
                         let cmd = if *u { PeerCommand::Unchoke } else { PeerCommand::Choke };
@@ -472,6 +478,7 @@ impl Torrent {
                 peer.send_msg(Message::piece(data))
                     .await
                     .context("[!] Failed to send piece to the peer")?;
+                peer_ctrl.lock().await[peer_index].uploaded += piece_data.len() as u64;
                 Ok(0)
             }
             _ => {
@@ -484,8 +491,29 @@ impl Torrent {
         }
     }
 
-    fn recalc_unchoke(state: Arc<Mutex<Vec<SharedPeerCtrl>>>) -> Vec<bool> {
-        Vec::new()
+    async fn recalc_unchoke(state: Arc<Mutex<Vec<SharedPeerCtrl>>>) -> Vec<bool> {
+        let mut state = state.lock().await;
+        let mut upload_rates: Vec<(usize, f64)> = state
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, p)| p.peer_interested)
+            .map(|(i, mut p)| {
+                let rate = (p.uploaded - p.uploaded_prev) as f64;
+                p.uploaded_prev = p.uploaded;
+                (i, rate)
+            })
+            .collect();
+        upload_rates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut result = vec![true; state.len()];
+
+        for (i, _) in upload_rates.iter().skip(4) {
+            result[*i] = false;
+            if !state[*i].am_choking {
+                state[*i].am_choking = true;
+            }
+        }
+
+        result
     }
 }
 
@@ -509,7 +537,6 @@ pub struct TorrentInfo {
     pub progress: f64,       // 0.0 - 100.0
     pub download_rate: f64,  // bytes/s (smoothed)
     pub upload_rate: f64,
-    pub error: Option<String>,
 }
 
 impl TorrentInfo {
@@ -524,7 +551,6 @@ impl TorrentInfo {
             progress: 0.0,
             download_rate: 0.0,
             upload_rate: 0.0,
-            error: None,
         })
     }
 }
