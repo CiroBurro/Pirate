@@ -8,6 +8,8 @@ use crate::core::{
     torrent_file::TorrentFile,
     tracker::{complete_msg, get_peers},
 };
+use crate::persistence::resume_data::ResumeData;
+use crate::persistence::Persistent;
 use anyhow::{bail, Context, Result};
 use std::{path::PathBuf, sync::Arc};
 use tokio::io::AsyncWriteExt;
@@ -79,6 +81,7 @@ impl Torrent {
         self,
         id: TorrentId,
         download_dir: PathBuf,
+        torrent_path: PathBuf,
         event_tx: Sender<ClientEvent>,
     ) -> Result<TorrentHandle> {
         let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
@@ -87,6 +90,7 @@ impl Torrent {
             id,
             &self,
             download_dir.clone(),
+            torrent_path.clone(),
         )?));
         let info_clone = info.clone();
         tokio::spawn(async move {
@@ -219,6 +223,9 @@ impl Torrent {
                                 id: i.id,
                                 state: i.state.clone(),
                             })?;
+
+                            let resume_data = ResumeData::new(i.downloaded, self.piece_picker.lock().await.bitfield.data.clone());
+                            resume_data.save(&hex::encode(i.info_hash)).await?;
 
                             drop(i);
                             complete_msg(&self).await;
@@ -566,6 +573,7 @@ pub struct TorrentInfo {
     pub name: String,
     pub info_hash: [u8; 20],
     pub download_dir: PathBuf,
+    pub torrent_path: PathBuf,
     pub total_size: u64,
     pub downloaded: u64,
     pub uploaded: u64,
@@ -576,12 +584,18 @@ pub struct TorrentInfo {
 }
 
 impl TorrentInfo {
-    pub fn new(id: TorrentId, torrent: &Torrent, download_dir: PathBuf) -> Result<Self> {
+    pub fn new(
+        id: TorrentId,
+        torrent: &Torrent,
+        download_dir: PathBuf,
+        torrent_path: PathBuf,
+    ) -> Result<Self> {
         Ok(Self {
             id,
             name: torrent.file.info.name.clone(),
             info_hash: torrent.info_hash,
             download_dir,
+            torrent_path,
             total_size: torrent.file.info.total_len()? as u64,
             downloaded: 0,
             uploaded: 0,
