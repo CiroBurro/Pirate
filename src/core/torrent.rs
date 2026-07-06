@@ -1,4 +1,4 @@
-use crate::client::{ClientEvent, Config};
+use crate::client::ClientEvent;
 use crate::core::peer::{PeerCommand, PeerHandshake, SharedPeerCtrl};
 use crate::core::{
     bitfield::BitField,
@@ -78,15 +78,17 @@ impl Torrent {
     pub fn spawn(
         self,
         id: TorrentId,
-        config: &Config,
+        download_dir: PathBuf,
         event_tx: Sender<ClientEvent>,
     ) -> Result<TorrentHandle> {
         let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
 
-        let info = Arc::new(RwLock::new(TorrentInfo::new(id, &self)?));
+        let info = Arc::new(RwLock::new(TorrentInfo::new(
+            id,
+            &self,
+            download_dir.clone(),
+        )?));
         let info_clone = info.clone();
-        let download_dir = config.download_dir.clone();
-
         tokio::spawn(async move {
             let _ = self.run(ctrl_rx, info_clone, event_tx, download_dir).await;
         });
@@ -212,7 +214,7 @@ impl Torrent {
                         }
                         Some(TorrentCommand::Stop) => {
                             let mut i = info.write().await;
-                            i.state = TorrentState::Completed;
+                            i.state = TorrentState::Stopped;
                             event_tx.send(ClientEvent::StateChanged {
                                 id: i.id,
                                 state: i.state.clone(),
@@ -555,7 +557,7 @@ pub enum TorrentState {
     Seeding,
     Paused,
     Error,
-    Completed,
+    Stopped,
 }
 
 #[derive(Clone)]
@@ -563,21 +565,23 @@ pub struct TorrentInfo {
     pub id: TorrentId,
     pub name: String,
     pub info_hash: [u8; 20],
+    pub download_dir: PathBuf,
     pub total_size: u64,
     pub downloaded: u64,
     pub uploaded: u64,
-    pub state: TorrentState, // Downloading | Seeding | Paused | Error | Completed
+    pub state: TorrentState, // Downloading | Seeding | Paused | Error | Stopped
     pub progress: f64,       // 0.0 - 100.0
     pub download_rate: f64,  // bytes/s (smoothed)
     pub upload_rate: f64,
 }
 
 impl TorrentInfo {
-    pub fn new(id: TorrentId, torrent: &Torrent) -> Result<Self> {
+    pub fn new(id: TorrentId, torrent: &Torrent, download_dir: PathBuf) -> Result<Self> {
         Ok(Self {
             id,
             name: torrent.file.info.name.clone(),
             info_hash: torrent.info_hash,
+            download_dir,
             total_size: torrent.file.info.total_len()? as u64,
             downloaded: 0,
             uploaded: 0,

@@ -3,10 +3,12 @@ use crate::core::torrent::{
 };
 use crate::core::torrent_file::TorrentFile;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{error, info};
@@ -49,12 +51,40 @@ pub enum ClientEvent {
     ClientError(String),
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Config {
     pub peer_id: [u8; 20],
     pub download_dir: PathBuf,
     pub listen_port: u16,
     pub max_peers_per_torrent: usize,
     pub max_uploads: usize,
+}
+
+impl Config {
+    pub async fn save(&self) -> Result<()> {
+        let file_path = dirs::data_dir()
+            .unwrap_or_default()
+            .join("pirate")
+            .join("config.json");
+
+        tokio::fs::create_dir_all(file_path.parent().unwrap()).await?;
+
+        let json = serde_json::to_string_pretty(self)?;
+        tokio::fs::write(file_path, json).await?;
+        Ok(())
+    }
+
+    pub async fn load() -> Result<Self> {
+        let file_path = dirs::data_dir()
+            .unwrap_or_default()
+            .join("pirate")
+            .join("config.json");
+
+        tokio::fs::create_dir_all(file_path.parent().unwrap()).await?;
+
+        let data = tokio::fs::read(file_path).await?;
+        Ok(serde_json::from_slice(&data)?)
+    }
 }
 
 impl Default for Config {
@@ -78,7 +108,8 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(config: Config) -> Self {
+    pub async fn new() -> Self {
+        let config = Config::load().await.unwrap_or_default();
         let (event_tx, _) = broadcast::channel(256);
         Self {
             config,
@@ -93,13 +124,18 @@ impl Client {
         self.event_tx.subscribe()
     }
 
-    pub async fn add_torrent(&mut self, path: PathBuf) -> Result<TorrentId> {
-        let torrent_file = TorrentFile::from_file(path).await?;
+    pub async fn add_torrent(
+        &mut self,
+        torrent_path: PathBuf,
+        download_dir: Option<PathBuf>,
+    ) -> Result<TorrentId> {
+        let torrent_file = TorrentFile::from_file(torrent_path).await?;
         let torrent = Torrent::new(torrent_file, self.config.peer_id).await?;
         let info_hash = torrent.info_hash;
         let id = self.next_id;
         self.next_id += 1;
-        let handle = torrent.spawn(id, &self.config, self.event_tx.clone())?;
+        let download_dir = download_dir.unwrap_or(self.config.download_dir.clone());
+        let handle = torrent.spawn(id, download_dir, self.event_tx.clone())?;
         self.emit(ClientEvent::TorrentAdded {
             id,
             name: handle.info.read().await.name.clone(),

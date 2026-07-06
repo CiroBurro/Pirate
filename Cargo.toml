@@ -8,6 +8,7 @@ tokio = { version = "*", features = ["full"] }
 serde = { version = "*", features = ["derive"] }
 serde_bencode = "*"
 serde_bytes = "*"
+serde_json = "1.0.150"
 sha1 = "*"
 anyhow = "*"
 url = "*"
