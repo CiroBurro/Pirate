@@ -3,7 +3,7 @@ use crate::core::torrent::{TorrentId, TorrentInfo, TorrentState};
 use crate::tui::screen::Screen;
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Constraint::{Length, Min};
+use ratatui::layout::Constraint::{Length, Min, Percentage};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::{Modifier, Stylize};
 use ratatui::style::Color;
@@ -76,7 +76,7 @@ impl App {
             .title("Torrent list")
             .fg(Color::Cyan)
             .bg(Color::Black);
-        let header = Row::new(vec!["Name", "Progress", "Downloaded"]);
+        let header = Row::new(vec!["Name", "Progress", "Downloaded", "Status"]);
         let rows: Vec<Row> = self
             .torrents
             .iter()
@@ -85,10 +85,16 @@ impl App {
                     t.name.clone(),
                     format!("{:.1}%", t.progress),
                     format!("{:.2} MB", t.downloaded as f64 / 1_000_000.0),
+                    t.state.to_string(),
                 ])
             })
             .collect();
-        let widths = [Min(10), Length(15), Length(17)];
+        let widths = [
+            Percentage(30),
+            Percentage(22),
+            Percentage(22),
+            Percentage(21),
+        ];
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)

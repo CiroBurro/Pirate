@@ -10,6 +10,7 @@ use crate::core::{
 use crate::persistence::resume_data::ResumeData;
 use crate::persistence::Persistent;
 use anyhow::{bail, Context, Result};
+use std::fmt::Display;
 use std::{path::PathBuf, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -196,10 +197,15 @@ impl Torrent {
                             picker.paused = true;
                         },
                         Some(TorrentCommand::Resume) => {
-                            let mut picker = self.piece_picker.lock().await;
-                            let mut i = info.write().await;
-                            i.state = TorrentState::Downloading;
-                            picker.paused = false;
+                            {
+                                let mut picker = self.piece_picker.lock().await;
+                                let mut i = info.write().await;
+                                i.state = TorrentState::Downloading;
+                                picker.paused = false;
+                            }
+                            for tx in &txs {
+                                let _ = tx.send(PeerCommand::RequestBlock).await;
+                            }
                         }
                         Some(TorrentCommand::Stop) => {
                             let mut i = info.write().await;
@@ -320,10 +326,25 @@ impl Torrent {
                 }
                 peer_cmd = peer_cmd_rx.recv() => {
                     match peer_cmd {
-                        Some(PeerCommand::Choke) => peer.send_msg(Message::choke()),
-                        Some(PeerCommand::Unchoke) => peer.send_msg(Message::unchoke()),
+                        Some(PeerCommand::Choke) => {
+                            peer.send_msg(Message::choke()).await?;
+                        }
+                        Some(PeerCommand::Unchoke) => {
+                            peer.send_msg(Message::unchoke()).await?;
+                        }
+                        Some(PeerCommand::RequestBlock) => {
+                            if !peer.status.am_choked {
+                                let block = piece_picker.lock().await.pick(&peer.status.bitfield);
+                                if let Some(b) = block {
+                                    peer.send_msg(
+                                        Message::request(b.to_payload().as_slice().try_into()?),
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
                         None => continue,
-                    }.await?;
+                    }
                 }
             }
         }
@@ -511,6 +532,12 @@ pub enum TorrentState {
     Paused,
     Error,
     Stopped,
+}
+
+impl Display for TorrentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(Clone)]

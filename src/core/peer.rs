@@ -163,4 +163,5 @@ impl Default for SharedPeerCtrl {
 pub enum PeerCommand {
     Choke,
     Unchoke,
+    RequestBlock,
 }
