@@ -75,7 +75,9 @@ async fn main() -> anyhow::Result<()> {
                 download_dir,
             } => {
                 client = Client::new(config, log_buffer).await?;
-                client.add_torrent(torrent_path, download_dir).await?;
+                client
+                    .add_torrent(torrent_path.canonicalize()?, download_dir)
+                    .await?;
             }
         }
     } else {

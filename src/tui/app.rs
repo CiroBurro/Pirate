@@ -166,8 +166,7 @@ impl App {
         }
     }
     async fn handle_key_main(&mut self, key: KeyEvent, client: &mut Client) {
-        let torrent_selected =
-            self.torrents[self.table_state.selected().unwrap_or_default()].clone();
+        let selected = self.table_state.selected();
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -184,37 +183,48 @@ impl App {
                 let max = self.torrents.len().saturating_sub(1);
                 self.table_state.select(Some((i + 1).min(max)));
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if selected.is_some() => {
+                let torrent_selected = self.torrents[selected.unwrap()].clone();
                 self.screen = Screen::Detail {
                     id: torrent_selected.id,
                 }
             }
-            KeyCode::Char('p') => match torrent_selected.state {
-                TorrentState::Paused | TorrentState::Stopped => {
-                    self.error = String::from("The torrent selected is already paused");
-                    self.show_err_popup = true;
+            KeyCode::Char('p') if selected.is_some() => {
+                let torrent_selected = self.torrents[selected.unwrap()].clone();
+                match torrent_selected.state {
+                    TorrentState::Paused | TorrentState::Stopped => {
+                        self.error = String::from("The torrent selected is already paused");
+                        self.show_err_popup = true;
+                    }
+                    TorrentState::Downloading | TorrentState::Seeding => {
+                        client.pause(torrent_selected.id).await
+                    }
+                    _ => (),
                 }
-                TorrentState::Downloading | TorrentState::Seeding => {
-                    client.pause(torrent_selected.id).await
+            }
+            KeyCode::Char('r') if selected.is_some() => {
+                let torrent_selected = self.torrents[selected.unwrap()].clone();
+                match torrent_selected.state {
+                    TorrentState::Downloading | TorrentState::Seeding => {
+                        self.error = String::from(
+                            "The torrent selected is already being downloaded or seeded",
+                        );
+                        self.show_err_popup = true;
+                    }
+                    TorrentState::Paused => client.resume(torrent_selected.id).await,
+                    _ => (),
                 }
-                _ => (),
-            },
-            KeyCode::Char('r') => match torrent_selected.state {
-                TorrentState::Downloading | TorrentState::Seeding => {
-                    self.error =
-                        String::from("The torrent selected is already being downloaded or seeded");
-                    self.show_err_popup = true;
+            }
+            KeyCode::Char('c') if selected.is_some() => {
+                let torrent_selected = self.torrents[selected.unwrap()].clone();
+                match client.remove(torrent_selected.id).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        self.error = "Failed to remove torrent: ".to_owned() + &e.to_string();
+                        self.show_err_popup = true;
+                    }
                 }
-                TorrentState::Paused => client.resume(torrent_selected.id).await,
-                _ => (),
-            },
-            KeyCode::Char('c') => match client.remove(torrent_selected.id).await {
-                Ok(_) => (),
-                Err(e) => {
-                    self.error = "Failed to remove torrent: ".to_owned() + &e.to_string();
-                    self.show_err_popup = true;
-                }
-            },
+            }
             KeyCode::Tab => self.screen = Screen::Log,
             _ => (),
         }

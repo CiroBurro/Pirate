@@ -74,9 +74,18 @@ impl Client {
         torrent_path: PathBuf,
         download_dir: Option<PathBuf>,
     ) -> Result<TorrentId> {
+        for handle in self.torrents.iter() {
+            let i = handle.info.read().await;
+            if i.torrent_path == torrent_path {
+                return Ok(i.id);
+            }
+        }
+
         let torrent_file = TorrentFile::from_file(torrent_path.clone()).await?;
         let torrent = Torrent::new(torrent_file, self.config.peer_id).await?;
         let info_hash = torrent.info_hash;
+
+        // Load resume data
         let info_hash_hex = hex::encode(info_hash);
         let mut downloaded = 0;
         if let Ok(resume_data) = ResumeData::load(&info_hash_hex).await {
@@ -97,11 +106,17 @@ impl Client {
             }
             downloaded = resume_data.downloaded;
         }
+
+        // Spawning the torrent process
         let id = self.next_id;
         self.next_id += 1;
-        let download_dir = download_dir.unwrap_or(self.config.download_dir.clone());
+        let download_dir = download_dir
+            .unwrap_or(self.config.download_dir.clone())
+            .canonicalize()?;
         let handle = torrent.spawn(id, download_dir.clone(), torrent_path.clone())?;
         handle.info.write().await.downloaded = downloaded;
+
+        // Updating the routing info hash map and the session data
         self.info_hash_map
             .lock()
             .await
@@ -119,7 +134,6 @@ impl Client {
         let name = handle.info.read().await.name.clone();
         info!("Torrent added: [{id}] {name}");
         self.torrents.push(handle);
-
         Ok(id)
     }
 
@@ -158,13 +172,13 @@ impl Client {
             let info_hash = handle.info.read().await.info_hash;
             let file_name = hex::encode(info_hash);
             let _ = handle.ctrl_tx.send(TorrentCommand::Cancel).await;
-            tokio::fs::remove_file(
+            let _ = tokio::fs::remove_file(
                 dirs::data_dir()
                     .unwrap_or_default()
                     .join("pirate")
                     .join(format!("{}.dat", file_name)),
             )
-            .await?;
+            .await;
             info!("Resume data deleted for [{id}]");
             let torrent_path_to_remove = handle.info.read().await.torrent_path.clone();
             self.session
