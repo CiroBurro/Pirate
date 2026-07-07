@@ -18,8 +18,6 @@ pub struct Config {
     pub peer_id: [u8; 20],
     pub download_dir: PathBuf,
     pub listen_port: u16,
-    pub max_peers_per_torrent: usize,
-    pub max_uploads: usize,
 }
 
 impl Persistent for Config {}
@@ -30,8 +28,6 @@ impl Default for Config {
             peer_id: *b"-PR1337-012345678901",
             download_dir: dirs::download_dir().unwrap_or_default(),
             listen_port: 6881,
-            max_peers_per_torrent: 50,
-            max_uploads: 8,
         }
     }
 }
@@ -47,8 +43,7 @@ pub struct Client {
 
 impl Client {
     #[instrument(skip_all)]
-    pub async fn new() -> Result<Self> {
-        let config: Config = Config::load("config").await.unwrap_or_default();
+    pub async fn new(config: Config) -> Result<Self> {
         let session: Session = Session::load("session").await.unwrap_or_default();
         info!("Config loaded; listen_port={}", config.listen_port);
         info!("Session loaded with {} torrent(s)", session.inner.len());
@@ -89,9 +84,7 @@ impl Client {
                     .piece_picker
                     .lock()
                     .await
-                    .bitfield
-                    .data
-                    .copy_from_slice(&resume_data.bitfield_data);
+                    .restore(&resume_data.bitfield_data);
                 info!("Resume data restored for {}", info_hash_hex);
             } else {
                 warn!(
