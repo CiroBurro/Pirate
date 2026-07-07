@@ -1,5 +1,6 @@
 use crate::core::torrent::{Torrent, TorrentCommand, TorrentHandle, TorrentId, TorrentInfo};
 use crate::core::torrent_file::TorrentFile;
+use crate::log::LogBuffer;
 use crate::persistence::resume_data::ResumeData;
 use crate::persistence::session::{Session, SessionEntry};
 use crate::persistence::Persistent;
@@ -35,6 +36,7 @@ impl Default for Config {
 pub struct Client {
     config: Config,
     session: Session,
+    log_buffer: LogBuffer,
     torrents: Vec<TorrentHandle>,
     info_hash_map: Arc<Mutex<HashMap<[u8; 20], mpsc::Sender<TorrentCommand>>>>,
     next_id: TorrentId,
@@ -43,14 +45,15 @@ pub struct Client {
 
 impl Client {
     #[instrument(skip_all)]
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(config: Config, log_buffer: LogBuffer) -> Result<Self> {
         let session: Session = Session::load("session").await.unwrap_or_default();
         info!("Config loaded; listen_port={}", config.listen_port);
         info!("Session loaded with {} torrent(s)", session.inner.len());
         let mut result = Self {
             config,
-            torrents: Vec::new(),
             session: session.clone(),
+            log_buffer,
+            torrents: Vec::new(),
             info_hash_map: Arc::new(Mutex::new(HashMap::new())),
             next_id: 1,
             listener_handle: None,
@@ -224,5 +227,11 @@ impl Client {
             }
         }));
         Ok(())
+    }
+
+    pub fn get_log(&self) -> String {
+        let result = self.log_buffer.get_logs();
+        self.log_buffer.clear();
+        result
     }
 }

@@ -1,11 +1,13 @@
 pub mod cli;
 pub mod client;
 pub mod core;
+pub mod log;
 pub mod persistence;
 pub mod tui;
 
 use crate::cli::{Args, ConfigCommands, MainCommands};
 use crate::client::Config;
+use crate::log::LogBuffer;
 use crate::persistence::Persistent;
 use crate::tui::app::App;
 use clap::Parser;
@@ -14,16 +16,23 @@ use ratatui::crossterm;
 use ratatui::crossterm::event::Event;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, Layer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    /*
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    let log_buffer = LogBuffer::default();
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .compact()
+                .with_ansi(false)
+                .with_writer(log_buffer.clone())
+                .with_filter(LevelFilter::INFO),
         )
-        .with_target(true)
-        .init(); */
+        .init();
 
     let args = Args::parse();
     let mut config: Config = Config::load("config").await.unwrap_or_default();
@@ -65,12 +74,12 @@ async fn main() -> anyhow::Result<()> {
                 torrent_path,
                 download_dir,
             } => {
-                client = Client::new(config).await?;
+                client = Client::new(config, log_buffer).await?;
                 client.add_torrent(torrent_path, download_dir).await?;
             }
         }
     } else {
-        client = Client::new(config).await?;
+        client = Client::new(config, log_buffer).await?;
     }
 
     let (key_tx, key_rx) = mpsc::channel(32);

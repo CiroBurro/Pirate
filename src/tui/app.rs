@@ -4,15 +4,15 @@ use crate::tui::screen::Screen;
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Constraint::{Length, Min, Percentage};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Layout, Rect};
 use ratatui::prelude::{Modifier, Stylize};
 use ratatui::style::Color;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
-#[derive(Default)]
 pub struct App {
     screen: Screen,
     torrents: Vec<TorrentInfo>,
@@ -20,6 +20,23 @@ pub struct App {
     should_quit: bool,
     show_err_popup: bool,
     error: String,
+    logs: VecDeque<String>,
+    max_logs: usize,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            screen: Screen::default(),
+            torrents: Vec::new(),
+            table_state: TableState::default(),
+            should_quit: false,
+            show_err_popup: false,
+            error: String::new(),
+            logs: VecDeque::new(),
+            max_logs: 30,
+        }
+    }
 }
 
 impl App {
@@ -29,11 +46,11 @@ impl App {
         mut key_rx: mpsc::Receiver<KeyEvent>,
         client: &mut Client,
     ) -> Result<()> {
-        while !self.should_quit {
-            terminal.draw(|f| self.draw(f))?;
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while !self.should_quit {
+            terminal.draw(|f| self.draw(f, client.get_log()))?;
 
             tokio::select! {
                 _ = tick.tick() => self.torrents = client.all_torrents().await,
@@ -44,7 +61,20 @@ impl App {
         client.shutdown().await;
         Ok(())
     }
-    fn draw(&mut self, frame: &mut Frame<'_>) {
+    fn draw(&mut self, frame: &mut Frame<'_>, log: String) {
+        if !log.is_empty() {
+            self.logs.push_back(log);
+        }
+        let text = self
+            .logs
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.lines().count() >= self.max_logs {
+            self.logs.pop_front();
+        }
+
         let [main_area, footer] = Layout::vertical([Min(0), Length(1)]).areas(frame.area());
         match self.screen {
             Screen::Main => {
@@ -54,16 +84,14 @@ impl App {
                 self.draw_detailed(frame, main_area, id);
             }
             Screen::Log => {
-                self.draw_log(frame, main_area);
+                self.draw_log(frame, main_area, text);
             }
         }
         self.draw_footer(frame, footer);
 
         if self.show_err_popup {
             let popup_block = Block::bordered().title("Error").bold().fg(Color::Red);
-            let centered_area = frame
-                .area()
-                .centered(Constraint::Percentage(60), Constraint::Percentage(20));
+            let centered_area = frame.area().centered(Percentage(60), Percentage(20));
             frame.render_widget(Clear, centered_area);
             let paragraph = Paragraph::new(self.error.clone()).block(popup_block);
             frame.render_widget(paragraph, centered_area);
@@ -102,7 +130,17 @@ impl App {
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
     fn draw_detailed(&self, _frame: &mut Frame<'_>, _area: Rect, _id: TorrentId) {}
-    fn draw_log(&self, _frame: &mut Frame<'_>, _area: Rect) {}
+    fn draw_log(&mut self, frame: &mut Frame<'_>, area: Rect, text: String) {
+        let block = Block::bordered()
+            .bold()
+            .title("Logs")
+            .fg(Color::Cyan)
+            .bg(Color::Black);
+
+        let paragraph = Paragraph::new(text).white().block(block);
+
+        frame.render_widget(paragraph, area);
+    }
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let line = match self.screen {
             Screen::Main => Line::from(
@@ -117,8 +155,9 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent, client: &mut Client) {
-        if key.code == KeyCode::Esc && self.show_err_popup {
+        if (key.code == KeyCode::Esc || key.code == KeyCode::Enter) && self.show_err_popup {
             self.show_err_popup = false;
+            return;
         }
 
         match self.screen {
