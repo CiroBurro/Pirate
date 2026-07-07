@@ -31,7 +31,7 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
         .file
         .info
         .total_len()
-        .context("[!] Failed to get the total length of the files to download")?;
+        .context("Failed to get the total length of the files to download")?;
 
     let trackers = read_trackers(torrent);
 
@@ -62,7 +62,7 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
         }
     }
 
-    bail!("[!] All trackers failed");
+    bail!("All trackers failed");
 }
 
 #[instrument(skip(torrent))]
@@ -92,46 +92,43 @@ pub async fn tracker_handshake(
     event: u32,
 ) -> Result<Vec<Peer>> {
     if !url.starts_with("udp://") {
-        bail!("[!] The tracker's url must start with 'udp://'");
+        bail!("Tracker URL must start with 'udp://'");
     }
 
     let parsed_url = match url::Url::parse(&url) {
         Ok(url) => url,
-        Err(e) => bail!("[!] Failed to parse the tracker's url: {e}"),
+        Err(e) => bail!("Failed to parse tracker URL: {e}"),
     };
 
     let host = match parsed_url.host_str() {
         Some(h) => h,
-        None => bail!("[!] Failed to get the host from the url"),
+        None => bail!("Failed to extract host from tracker URL"),
     };
 
     let port = parsed_url.port().unwrap_or(80);
     let tracker_address = format!("{}:{}", host, port);
 
-    info!("[*] Trying to connect to tracker: {}", url);
-
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
-        .context("[!] Failed to bind the socket")?;
+        .context("Failed to bind UDP socket")?;
 
     socket
         .connect(&tracker_address)
         .await
-        .with_context(|| format!("[!] Failed to connect to the tracker: {url}"))?;
+        .with_context(|| format!("Failed to connect to tracker: {url}"))?;
 
     let connection_req = ConnectionRequest::default().serialize();
 
-    socket.send(&connection_req).await.with_context(|| {
-        format!("[!] Failed to send the connection request to the tracker: {url}")
-    })?;
+    socket
+        .send(&connection_req)
+        .await
+        .with_context(|| format!("Failed to send connection request to tracker: {url}"))?;
 
     let mut res = [0u8; 16];
     timeout(Duration::from_secs(2), socket.recv(&mut res))
         .await
-        .with_context(|| {
-            format!("[!] Failed to receive the connection id from the tracker: {url}")
-        })?
-        .with_context(|| format!("[-] Tracker timeout: {url}"))?;
+        .with_context(|| format!("Failed to receive connection ID from tracker: {url}"))?
+        .with_context(|| format!("Tracker timeout: {url}"))?;
 
     let connection_id = &res[8..16];
     let connection_id = i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
@@ -141,28 +138,24 @@ pub async fn tracker_handshake(
     socket
         .send(&announce_req.serialize())
         .await
-        .with_context(|| {
-            format!("[!] Failed to send the announce request to the tracker: {url}")
-        })?;
+        .with_context(|| format!("Failed to send announce request to tracker: {url}"))?;
 
     let mut peer_res = vec![0u8; 1024];
     let size = match tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut peer_res)).await
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            bail!("[!] Failed to receive peers from {url}\nError: {e}");
+            bail!("Failed to receive peers from {url}: {e}");
         }
         _ => {
-            bail!("[-] Announce connection timeout for {url}");
+            bail!("Announce connection timeout for {url}");
         }
     };
 
     peer_res.truncate(size);
 
     Ok(AnnounceResponse::parse(peer_res)
-        .with_context(|| {
-            format!("[!] Failed to parse the response with peers from tracker: {url}")
-        })?
+        .with_context(|| format!("Failed to parse announce response from tracker: {url}"))?
         .peers)
 }
 
@@ -280,7 +273,7 @@ impl AnnounceResponse {
                 port: u16::from_be_bytes(
                     chunk[4..]
                         .try_into()
-                        .context("[!] Failed to convert port bytes into an integer")?,
+                        .context("Failed to convert port bytes into an integer")?,
                 ),
                 status: PeerStatus::default(),
             });
@@ -290,27 +283,27 @@ impl AnnounceResponse {
             _action: i32::from_be_bytes(
                 slice[0..4]
                     .try_into()
-                    .context("[!] Failed to convert action bytes into an integer")?,
+                    .context("Failed to convert action bytes into an integer")?,
             ),
             _transaction_id: i32::from_be_bytes(
                 slice[4..8]
                     .try_into()
-                    .context("[!] Failed to convert transaction id bytes into an integer")?,
+                    .context("Failed to convert transaction id bytes into an integer")?,
             ),
             _interval: i32::from_be_bytes(
                 slice[8..12]
                     .try_into()
-                    .context("[!] Failed to convert interval bytes into an integer")?,
+                    .context("Failed to convert interval bytes into an integer")?,
             ),
             _leechers: i32::from_be_bytes(
                 slice[12..16]
                     .try_into()
-                    .context("[!] Failed to convert leechers bytes into an integer")?,
+                    .context("Failed to convert leechers bytes into an integer")?,
             ),
             _seeders: i32::from_be_bytes(
                 slice[16..20]
                     .try_into()
-                    .context("[!] Failed to convert seeders bytes into an integer")?,
+                    .context("Failed to convert seeders bytes into an integer")?,
             ),
             peers,
         })

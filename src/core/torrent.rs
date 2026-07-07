@@ -1,4 +1,3 @@
-use crate::client::ClientEvent;
 use crate::core::peer::{PeerCommand, PeerHandshake, SharedPeerCtrl};
 use crate::core::{
     bitfield::BitField,
@@ -14,7 +13,6 @@ use anyhow::{bail, Context, Result};
 use std::{path::PathBuf, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, instrument, warn};
@@ -82,7 +80,6 @@ impl Torrent {
         id: TorrentId,
         download_dir: PathBuf,
         torrent_path: PathBuf,
-        event_tx: Sender<ClientEvent>,
     ) -> Result<TorrentHandle> {
         let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
 
@@ -94,13 +91,12 @@ impl Torrent {
         )?));
         let info_clone = info.clone();
         tokio::spawn(async move {
-            let _ = self.run(ctrl_rx, info_clone, event_tx, download_dir).await;
+            let _ = self.run(ctrl_rx, info_clone, download_dir).await;
         });
 
         Ok(TorrentHandle { id, info, ctrl_tx })
     }
 
-    #[instrument(skip(self))]
     pub async fn activate_peers(&mut self) {
         let info_hash = self.info_hash;
         let peer_id = self.peer_id;
@@ -116,7 +112,7 @@ impl Torrent {
                 .await
                 {
                     Ok(Ok(_)) => {
-                        info!("Handshake successfully completed with {}", peer);
+                        debug!("Handshake successfully completed with {}", peer);
                         true
                     }
                     Ok(Err(e)) => {
@@ -151,7 +147,6 @@ impl Torrent {
         mut self,
         mut ctrl_rx: Receiver<TorrentCommand>,
         info: Arc<RwLock<TorrentInfo>>,
-        event_tx: Sender<ClientEvent>,
         download_dir: PathBuf,
     ) -> Result<()> {
         self.activate_peers().await;
@@ -179,8 +174,6 @@ impl Torrent {
                 piece_picker,
                 file,
                 download_dir.clone(),
-                event_tx.clone(),
-                info.read().await.id,
                 rx,
             ));
         }
@@ -201,29 +194,16 @@ impl Torrent {
                             let mut i = info.write().await;
                             i.state = TorrentState::Paused;
                             picker.paused = true;
-                            event_tx.send(ClientEvent::StateChanged {
-                                id: i.id,
-                                state: i.state.clone(),
-                            })?;
                         },
                         Some(TorrentCommand::Resume) => {
                             let mut picker = self.piece_picker.lock().await;
                             let mut i = info.write().await;
                             i.state = TorrentState::Downloading;
                             picker.paused = false;
-                            event_tx.send(ClientEvent::StateChanged {
-                                id: i.id,
-                                state: i.state.clone(),
-                            })?;
                         }
                         Some(TorrentCommand::Stop) => {
                             let mut i = info.write().await;
                             i.state = TorrentState::Stopped;
-                            event_tx.send(ClientEvent::StateChanged {
-                                id: i.id,
-                                state: i.state.clone(),
-                            })?;
-
                             let resume_data = ResumeData::new(i.downloaded, self.piece_picker.lock().await.bitfield.data.clone());
                             resume_data.save(&hex::encode(i.info_hash)).await?;
 
@@ -259,8 +239,6 @@ impl Torrent {
                                 self.piece_picker.clone(),
                                 self.file.clone(),
                                 download_dir.clone(),
-                                event_tx.clone(),
-                                info.read().await.id,
                                 rx,
                             ));
                         }
@@ -289,13 +267,6 @@ impl Torrent {
                     prev_downloaded = i.downloaded as f64;
                     prev_uploaded = i.uploaded as f64;
 
-                    event_tx.send(ClientEvent::Progress {
-                        id: i.id,
-                        progress: i.progress,
-                        downloaded: i.downloaded,
-                        download_rate: i.download_rate,
-                        upload_rate: i.upload_rate,
-                    })?;
                 }
 
                 _ = timer.tick() => {
@@ -311,7 +282,7 @@ impl Torrent {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[allow(clippy::too_many_arguments)]
     async fn peer_loop(
         mut peer: Peer,
         peer_ctrl: Arc<Mutex<Vec<SharedPeerCtrl>>>,
@@ -319,13 +290,11 @@ impl Torrent {
         piece_picker: Arc<Mutex<PiecePicker>>,
         file: Arc<TorrentFile>,
         path: PathBuf,
-        event_tx: Sender<ClientEvent>,
-        id: TorrentId,
         mut peer_cmd_rx: Receiver<PeerCommand>,
     ) -> Result<()> {
         loop {
             tokio::select! {
-                msg_result = Self::read_msg(&mut peer, Arc::clone(&piece_picker), event_tx.clone(), id) => {
+                msg_result = Self::read_msg(&mut peer, Arc::clone(&piece_picker)) => {
                     if let Ok(msg) = msg_result {
                         match Self::handle_msg(
                             &mut peer,
@@ -340,20 +309,12 @@ impl Torrent {
                             Ok(_) => return Ok(()), // Connection should be closed if exit code != 0
                             Err(e) => {
                                 error!("[!] Error in handle_msg with {}: {}", peer, e);
-                                event_tx.send(ClientEvent::Error {
-                                    id,
-                                    message: format!("[!] Error in handle_msg with {}: {}", peer, e),
-                                })?;
                                 return Err(e);
                             }
                         }
 
                     } else if let Err(e) = msg_result {
                         error!("[!] Connection lost with {}: {}", peer, e);
-                        event_tx.send(ClientEvent::Error {
-                            id,
-                            message: format!("[!] Connection lost with {}: {}", peer, e),
-                        })?;
                         return Err(e);
                     }
                 }
@@ -368,19 +329,10 @@ impl Torrent {
         }
     }
 
-    async fn read_msg(
-        peer: &mut Peer,
-        piece_picker: Arc<Mutex<PiecePicker>>,
-        event_tx: Sender<ClientEvent>,
-        id: TorrentId,
-    ) -> Result<Message> {
+    async fn read_msg(peer: &mut Peer, piece_picker: Arc<Mutex<PiecePicker>>) -> Result<Message> {
         let readable = if let Some(stream) = peer.status.stream.as_ref() {
             tokio::time::timeout(std::time::Duration::from_secs(5), stream.readable()).await
         } else {
-            event_tx.send(ClientEvent::Error {
-                id,
-                message: String::from("No readable stream"),
-            })?;
             debug!("No readable stream");
             return Err(anyhow::anyhow!("No readable stream"));
         };
@@ -390,10 +342,6 @@ impl Torrent {
             Ok(Err(e)) => {
                 error!("[!] Stream error with {}: {}", peer, e);
 
-                event_tx.send(ClientEvent::Error {
-                    id,
-                    message: format!("[!] Stream error with {}: {}", peer, e),
-                })?;
                 Err(e.into())
             }
             Err(e) => {
@@ -410,7 +358,7 @@ impl Torrent {
         }
     }
 
-    #[instrument(skip_all)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_msg(
         peer: &mut Peer,
         peer_ctrl: Arc<Mutex<Vec<SharedPeerCtrl>>>,
@@ -444,8 +392,6 @@ impl Torrent {
                     peer.send_msg(Message::request(b.to_payload().as_slice().try_into()?))
                         .await
                         .context("[!] Failed to send request message to the peer")?;
-                } else {
-                    debug!("No block picked");
                 }
                 Ok(0)
             }

@@ -1,6 +1,4 @@
-use crate::core::torrent::{
-    Torrent, TorrentCommand, TorrentHandle, TorrentId, TorrentInfo, TorrentState,
-};
+use crate::core::torrent::{Torrent, TorrentCommand, TorrentHandle, TorrentId, TorrentInfo};
 use crate::core::torrent_file::TorrentFile;
 use crate::persistence::resume_data::ResumeData;
 use crate::persistence::session::{Session, SessionEntry};
@@ -12,46 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, Mutex};
-use tracing::{debug, error, info, instrument, warn};
-
-#[derive(Clone, Debug)]
-pub enum ClientEvent {
-    TorrentAdded {
-        id: TorrentId,
-        name: String,
-    },
-    TorrentRemoved(TorrentId),
-    StateChanged {
-        id: TorrentId,
-        state: TorrentState,
-    },
-    Progress {
-        id: TorrentId,
-        progress: f64,
-        downloaded: u64,
-        download_rate: f64,
-        upload_rate: f64,
-    },
-    PieceCompleted {
-        id: TorrentId,
-        index: usize,
-    },
-    TorrentCompleted(TorrentId),
-    PeerConnected {
-        id: TorrentId,
-        peer: String,
-    },
-    PeerDisconnected {
-        id: TorrentId,
-        peer: String,
-    },
-    Error {
-        id: TorrentId,
-        message: String,
-    },
-    ClientError(String),
-}
+use tokio::sync::{mpsc, Mutex};
+use tracing::{error, info, instrument, warn};
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {
@@ -82,7 +42,7 @@ pub struct Client {
     torrents: Vec<TorrentHandle>,
     info_hash_map: Arc<Mutex<HashMap<[u8; 20], mpsc::Sender<TorrentCommand>>>>,
     next_id: TorrentId,
-    event_tx: broadcast::Sender<ClientEvent>,
+    listener_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Client {
@@ -91,18 +51,14 @@ impl Client {
         let config: Config = Config::load("config").await.unwrap_or_default();
         let session: Session = Session::load("session").await.unwrap_or_default();
         info!("Config loaded; listen_port={}", config.listen_port);
-        info!(
-            "Session loaded with {} torrent(s)",
-            session.inner.len()
-        );
-        let (event_tx, _) = broadcast::channel(256);
+        info!("Session loaded with {} torrent(s)", session.inner.len());
         let mut result = Self {
             config,
             torrents: Vec::new(),
             session: session.clone(),
             info_hash_map: Arc::new(Mutex::new(HashMap::new())),
             next_id: 1,
-            event_tx,
+            listener_handle: None,
         };
 
         for entry in session.inner {
@@ -110,11 +66,8 @@ impl Client {
                 .add_torrent(entry.torrent_path, Some(entry.download_dir))
                 .await?;
         }
+        result.start_listener().await?;
         Ok(result)
-    }
-
-    pub fn events(&self) -> broadcast::Receiver<ClientEvent> {
-        self.event_tx.subscribe()
     }
 
     #[instrument(skip(self, torrent_path))]
@@ -141,19 +94,17 @@ impl Client {
                     .copy_from_slice(&resume_data.bitfield_data);
                 info!("Resume data restored for {}", info_hash_hex);
             } else {
-                warn!("Resume data bitfield size mismatch for {}, ignoring", info_hash_hex);
+                warn!(
+                    "Resume data bitfield size mismatch for {}, ignoring",
+                    info_hash_hex
+                );
             }
             downloaded = resume_data.downloaded;
         }
         let id = self.next_id;
         self.next_id += 1;
         let download_dir = download_dir.unwrap_or(self.config.download_dir.clone());
-        let handle = torrent.spawn(
-            id,
-            download_dir.clone(),
-            torrent_path.clone(),
-            self.event_tx.clone(),
-        )?;
+        let handle = torrent.spawn(id, download_dir.clone(), torrent_path.clone())?;
         handle.info.write().await.downloaded = downloaded;
         self.info_hash_map
             .lock()
@@ -171,7 +122,6 @@ impl Client {
 
         let name = handle.info.read().await.name.clone();
         info!("Torrent added: [{id}] {name}");
-        self.emit(ClientEvent::TorrentAdded { id, name });
         self.torrents.push(handle);
 
         Ok(id)
@@ -194,17 +144,14 @@ impl Client {
     }
 
     pub async fn pause(&self, id: TorrentId) {
-        debug!("Pausing torrent [{id}]");
         self.send_cmd(id, TorrentCommand::Pause).await;
     }
 
     pub async fn resume(&self, id: TorrentId) {
-        debug!("Resuming torrent [{id}]");
         self.send_cmd(id, TorrentCommand::Resume).await;
     }
 
     pub async fn stop(&self, id: TorrentId) {
-        debug!("Stopping torrent [{id}]");
         self.send_cmd(id, TorrentCommand::Stop).await;
     }
 
@@ -229,7 +176,6 @@ impl Client {
                 .retain(|e| e.torrent_path.ne(&torrent_path_to_remove));
             self.info_hash_map.lock().await.remove(&info_hash);
             info!("Torrent [{id}] removed");
-            self.emit(ClientEvent::TorrentRemoved(id));
             Ok(())
         } else {
             warn!("Remove failed: torrent [{id}] not found");
@@ -238,7 +184,10 @@ impl Client {
     }
 
     #[instrument(skip(self))]
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&mut self) {
+        if let Some(handle) = self.listener_handle.take() {
+            handle.abort();
+        }
         let count = self.torrents.len();
         info!("Shutting down, stopping {count} torrent(s)...");
         for handle in self.torrents.drain(..) {
@@ -252,23 +201,17 @@ impl Client {
     async fn send_cmd(&self, id: TorrentId, cmd: TorrentCommand) {
         if let Some(handle) = self.torrents.iter().find(|h| h.id == id) {
             let _ = handle.ctrl_tx.send(cmd).await;
-        } else {
-            debug!("Command dropped: torrent [{id}] not found");
         }
     }
 
-    fn emit(&self, event: ClientEvent) {
-        let _ = self.event_tx.send(event);
-    }
-    async fn start_listener(&self) -> Result<()> {
+    async fn start_listener(&mut self) -> Result<()> {
         let map = self.info_hash_map.clone();
         let listener = TcpListener::bind(("0.0.0.0", self.config.listen_port)).await?;
 
-        tokio::spawn(async move {
+        self.listener_handle = Some(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((mut stream, addr)) => {
-                        info!("Incoming connection from {}", addr);
+                    Ok((mut stream, _addr)) => {
                         let mut buf = [0u8; 68];
                         if stream.read_exact(&mut buf).await.is_err() {
                             continue;
@@ -286,7 +229,7 @@ impl Client {
                     }
                 }
             }
-        });
+        }));
         Ok(())
     }
 }

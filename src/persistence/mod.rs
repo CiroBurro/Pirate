@@ -1,3 +1,5 @@
+#![allow(async_fn_in_trait)]
+
 pub mod resume_data;
 pub mod session;
 

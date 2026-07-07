@@ -39,31 +39,18 @@ impl Peer {
 
         let mut stream = TcpStream::connect(self.to_string().parse::<std::net::SocketAddr>()?)
             .await
-            .with_context(|| {
-                format!(
-                    "[!] Failed to connect to the socket to the address: {}",
-                    self
-                )
-            })?;
+            .with_context(|| format!("Failed to connect to peer: {}", self))?;
 
         info!("Connection to the peer {} successful", self.to_string());
 
         stream
             .write_all(&handshake.serialize())
             .await
-            .with_context(|| {
-                format!(
-                    "[!] Failed to send the handshake request to the peer: {}",
-                    self
-                )
-            })?;
+            .with_context(|| format!("Failed to send handshake to peer: {}", self))?;
 
         let mut buf = [0u8; 68];
         stream.read_exact(&mut buf).await.with_context(|| {
-            format!(
-                "[!] Failed to read the handshake response from peer: {}",
-                self
-            )
+            format!("Failed to read handshake response from peer: {}", self)
         })?;
 
         self.status.stream = Some(stream);
@@ -78,10 +65,7 @@ impl Peer {
                 .await
                 .with_context(|| format!("Failed to send message to peer: {}", self))?;
         } else {
-            bail!(
-                "[!] Trying to send a message but there is no open stream with the peer: {}",
-                self
-            );
+            bail!("No open stream with peer: {}", self);
         }
 
         Ok(())
@@ -93,7 +77,7 @@ impl Peer {
             stream
                 .read_exact(&mut buf_len)
                 .await
-                .context("[!] Failed to read message length from peer")?;
+                .context("Failed to read message length from peer")?;
 
             let len = u32::from_be_bytes(buf_len);
 
@@ -105,14 +89,11 @@ impl Peer {
             stream
                 .read_exact(&mut data)
                 .await
-                .with_context(|| format!("[!] Failed to read message from peer: {}", self))?;
+                .with_context(|| format!("Failed to read message from peer: {}", self))?;
 
             Message::parse(len, data)
         } else {
-            bail!(
-                "[!] Trying to read a message but there is no open stream with the peer: {}",
-                self
-            );
+            bail!("No open stream with peer: {}", self);
         }
     }
 }

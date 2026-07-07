@@ -367,6 +367,22 @@ impl PiecePicker {
         Ok(false)
     }
 
+    pub fn restore(&mut self, bitfield_data: &[u8]) {
+        let num_pieces = self.pieces.len();
+        if bitfield_data.len() != self.bitfield.data.len() {
+            return;
+        }
+        self.bitfield.data.copy_from_slice(bitfield_data);
+        let mut restored = 0;
+        for i in 0..num_pieces {
+            if self.bitfield.has_piece(i) {
+                self.pieces[i].status = PieceStatus::Completed;
+                restored += 1;
+            }
+        }
+        self.missing_pieces = num_pieces - restored;
+    }
+
     pub fn tick_timeouts(&mut self) {
         for piece in &mut self.pieces {
             if piece.status == PieceStatus::Downloading {

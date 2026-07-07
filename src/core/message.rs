@@ -65,7 +65,7 @@ impl Message {
         }
 
         let id = MessageId::try_from(u8::from_be(slice[0]))
-            .context("[!] Failed to parse the message id")?;
+            .context("Failed to parse the message id")?;
         let payload = slice[1..].to_vec();
 
         Ok(Self { len, id, payload })

@@ -21,9 +21,9 @@ impl TorrentFile {
     pub async fn from_file(path: PathBuf) -> Result<TorrentFile> {
         let data = fs::read(path)
             .await
-            .context("[!] Failed to read the torrent file")?;
+            .context("Failed to read the torrent file")?;
         let torrent: TorrentFile =
-            de::from_bytes(&data).context("[!] Failed to deserialize the torrent file content")?;
+            de::from_bytes(&data).context("Failed to deserialize the torrent file")?;
 
         Ok(torrent)
     }
@@ -41,7 +41,7 @@ pub struct Info {
 
 impl Info {
     pub fn get_info_hash(&self) -> Result<[u8; 20]> {
-        let bencoded_info = serde_bencode::to_bytes(self).context("[!] Failed to encode the Info data structure of the torrent file to calcultate the hash")?;
+        let bencoded_info = serde_bencode::to_bytes(self).context("Failed to encode the Info structure to calculate hash")?;
 
         let mut hasher = Sha1::new();
         hasher.update(&bencoded_info);
@@ -63,7 +63,7 @@ impl Info {
             }
             Ok(len)
         } else {
-            Err(anyhow!("[!] Both file length and files list are missing"))
+            Err(anyhow!("Both file length and files list are missing"))
         }
     }
 }
