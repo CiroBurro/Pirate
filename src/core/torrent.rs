@@ -182,107 +182,150 @@ impl Torrent {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
-
+        let mut unchoke_timer = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut announce_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+        announce_timer.tick().await; // Consume the immediate first tick
         let mut prev_downloaded: f64 = 0.0;
         let mut prev_uploaded: f64 = 0.0;
         loop {
             tokio::select! {
-                cmd = ctrl_rx.recv() => {
-                    match cmd {
-                        Some(TorrentCommand::Pause) => {
+                        cmd = ctrl_rx.recv() => {
+                            match cmd {
+                                Some(TorrentCommand::Pause) => {
+                                    let mut picker = self.piece_picker.lock().await;
+                                    let mut i = info.write().await;
+                                    i.state = TorrentState::Paused;
+                                    picker.paused = true;
+                                },
+                                Some(TorrentCommand::Resume) => {
+                                    {
+                                        let mut picker = self.piece_picker.lock().await;
+                                        let mut i = info.write().await;
+                                        i.state = TorrentState::Downloading;
+                                        picker.paused = false;
+                                    }
+                                    for tx in &txs {
+                                        let _ = tx.send(PeerCommand::RequestBlock).await;
+                                    }
+                                }
+                                Some(TorrentCommand::Stop) => {
+                                    let mut i = info.write().await;
+                                    i.state = TorrentState::Stopped;
+                                    let resume_data = ResumeData::new(i.downloaded, self.piece_picker.lock().await.bitfield.data.clone());
+                                    resume_data.save(&hex::encode(i.info_hash)).await?;
+
+                                    drop(i);
+                                    complete_msg(&self).await;
+                                    break;
+                                },
+                                Some(TorrentCommand::Cancel) => break,
+                                Some(TorrentCommand::NewPeer(mut stream)) => {
+                                    let mut handshake = PeerHandshake::default();
+                                    handshake.info_hash = self.info_hash;
+                                    handshake.peer_id = self.peer_id;
+
+                                    stream.writable().await?;
+
+                                    stream
+                                        .write_all(&handshake.serialize())
+                                        .await
+                                        .context("[!] Failed to send the handshake to the peer")?;
+
+                                    let peer = Peer::from_stream(stream)?;
+                                    let (tx, rx) = mpsc::channel::<PeerCommand>(16);
+                                    txs.push(tx);
+
+                                    let mut ctrl = control.lock().await;
+                                    ctrl.push(SharedPeerCtrl::default());
+                                    let i = ctrl.len() - 1;
+                                    drop(ctrl);
+                                    tokio::task::spawn(Self::peer_loop(
+                                        peer,
+                                        control.clone(),
+                                        i,
+                                        self.piece_picker.clone(),
+                                        self.file.clone(),
+                                        download_dir.clone(),
+                                        rx,
+                                    ));
+                                }
+                                None => break
+                            }
+                        }
+                        _ = tick.tick() => {
+
                             let mut picker = self.piece_picker.lock().await;
                             let mut i = info.write().await;
-                            i.state = TorrentState::Paused;
-                            picker.paused = true;
-                        },
-                        Some(TorrentCommand::Resume) => {
-                            {
-                                let mut picker = self.piece_picker.lock().await;
-                                let mut i = info.write().await;
-                                i.state = TorrentState::Downloading;
-                                picker.paused = false;
+                            let just_completed = picker.missing_pieces == 0 && i.state != TorrentState::Seeding;
+                            if just_completed {
+                                info!("[*] Download complete - now seeding");
+                                i.state = TorrentState::Seeding;
                             }
-                            for tx in &txs {
-                                let _ = tx.send(PeerCommand::RequestBlock).await;
-                            }
-                        }
-                        Some(TorrentCommand::Stop) => {
-                            let mut i = info.write().await;
-                            i.state = TorrentState::Stopped;
-                            let resume_data = ResumeData::new(i.downloaded, self.piece_picker.lock().await.bitfield.data.clone());
-                            resume_data.save(&hex::encode(i.info_hash)).await?;
+                            picker.tick_timeouts();
+
+                            i.downloaded = i.total_size.saturating_sub((picker.missing_pieces * self.file.info.piece_length as usize) as u64);
+                            let total_pieces = picker.piece_frequencies.len();
+                            let downloaded_pieces = total_pieces - picker.missing_pieces;
+                            i.progress = downloaded_pieces as f64 * 100.0 / total_pieces as f64;
+                            i.download_rate = i.downloaded as f64 - prev_downloaded;
+                            i.uploaded = control.lock().await.iter().map(|p| p.uploaded).sum();
+                            i.upload_rate = i.uploaded as f64 - prev_uploaded;
+
+                            prev_downloaded = i.downloaded as f64;
+                            prev_uploaded = i.uploaded as f64;
 
                             drop(i);
-                            complete_msg(&self).await;
-                            break;
-                        },
-                        Some(TorrentCommand::Cancel) => break,
-                        Some(TorrentCommand::NewPeer(mut stream)) => {
-                            let mut handshake = PeerHandshake::default();
-                            handshake.info_hash = self.info_hash;
-                            handshake.peer_id = self.peer_id;
+                            drop(picker);
 
-                            stream.writable().await?;
-
-                            stream
-                                .write_all(&handshake.serialize())
-                                .await
-                                .context("[!] Failed to send the handshake to the peer")?;
-
-                            let peer = Peer::from_stream(stream)?;
-                            let (tx, rx) = mpsc::channel::<PeerCommand>(16);
-                            txs.push(tx);
-
-                            let mut ctrl = control.lock().await;
-                            ctrl.push(SharedPeerCtrl::default());
-                            let i = ctrl.len() - 1;
-                            drop(ctrl);
-                            tokio::task::spawn(Self::peer_loop(
-                                peer,
-                                control.clone(),
-                                i,
-                                self.piece_picker.clone(),
-                                self.file.clone(),
-                                download_dir.clone(),
-                                rx,
-                            ));
+                            if just_completed {
+                                complete_msg(&self).await;
+                            }
                         }
-                        None => break
-                    }
-                }
-                _ = tick.tick() => {
 
-                    let mut picker = self.piece_picker.lock().await;
-                    let mut i = info.write().await;
-                    if picker.missing_pieces == 0 {
-                        info!("[*] Download complete - now seeding");
-                        i.state = TorrentState::Seeding;
-                        complete_msg(&self).await;
-                    }
-                    picker.tick_timeouts();
+                        _ = unchoke_timer.tick() => {
+                            let unchokes = Self::recalc_unchoke(control.clone()).await;
 
-                    i.downloaded = i.total_size.saturating_sub((picker.missing_pieces * self.file.info.piece_length as usize) as u64);
-                    let total_pieces = picker.piece_frequencies.len();
-                    let downloaded_pieces = total_pieces - picker.missing_pieces;
-                    i.progress = downloaded_pieces as f64 * 100.0 / total_pieces as f64;
-                    i.download_rate = i.downloaded as f64 - prev_downloaded;
-                    i.uploaded = control.lock().await.iter().map(|p| p.uploaded).sum();
-                    i.upload_rate = i.uploaded as f64 - prev_uploaded;
+                            for (u, tx) in unchokes.iter().zip(&txs) {
+                                let cmd = if *u { PeerCommand::Unchoke } else { PeerCommand::Choke };
+                                let _ = tx.send(cmd).await;
+                            }
+                        }
 
-                    prev_downloaded = i.downloaded as f64;
-                    prev_uploaded = i.uploaded as f64;
+                        _ = announce_timer.tick() => {
+                            let peers = get_peers(&self).await;
+                            if let Ok(peers) = peers {
+                                let info_hash = self.info_hash;
+                                let peer_id = self.peer_id;
 
-                }
+                                for mut peer in peers {
+                                // Handshake
+                                    let success = matches!(tokio::time::timeout(
+                                        std::time::Duration::from_secs(3),
+                                        peer.handshake(&info_hash, &peer_id),
+                                    ).await, Ok(Ok(_)));
 
-                _ = timer.tick() => {
-                    let unchokes = Self::recalc_unchoke(control.clone()).await;
-
-                    for (u, tx) in unchokes.iter().zip(&txs) {
-                        let cmd = if *u { PeerCommand::Unchoke } else { PeerCommand::Choke };
-                        let _ = tx.send(cmd).await;
-                    }
-                }
+                                    if success && peer.status.stream.is_some() {
+                                        let (tx, rx) = mpsc::channel::<PeerCommand>(16);
+                                        txs.push(tx);
+                                        let mut ctrl = control.lock().await;
+                                        ctrl.push(SharedPeerCtrl::default());
+                                        let i = ctrl.len() - 1;
+                                        drop(ctrl);
+                                        tokio::task::spawn(Self::peer_loop(
+                                            peer,
+                                            control.clone(),
+                                            i,
+                                            self.piece_picker.clone(),
+                                            self.file.clone(),
+                                            download_dir.clone(),
+                                            rx,
+                                        ));
+                                    }
+                                }
+                            } else {
+                                warn!("Re-announce failed to get peers");
+                            }
+                        }
             }
         }
         Ok(())
@@ -321,6 +364,7 @@ impl Torrent {
                                 return Err(e);
                             }
                         }
+
 
                     } else if let Err(e) = msg_result {
                         error!("[!] Connection lost with {}: {}", peer, e);
@@ -364,7 +408,7 @@ impl Torrent {
 
     async fn read_msg(peer: &mut Peer, piece_picker: Arc<Mutex<PiecePicker>>) -> Result<Message> {
         let readable = if let Some(stream) = peer.status.stream.as_ref() {
-            tokio::time::timeout(std::time::Duration::from_secs(2), stream.readable()).await
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.readable()).await
         } else {
             debug!("No readable stream");
             return Err(anyhow::anyhow!("No readable stream"));
@@ -422,7 +466,9 @@ impl Torrent {
                 peer.status.am_choked = false;
                 let needed = {
                     let ctrl = peer_ctrl.lock().await;
-                    ctrl[peer_index].max_pipeline.saturating_sub(ctrl[peer_index].pending_requests)
+                    ctrl[peer_index]
+                        .max_pipeline
+                        .saturating_sub(ctrl[peer_index].pending_requests)
                 };
                 for _ in 0..needed {
                     let block = piece_picker.lock().await.pick(&peer.status.bitfield);
@@ -471,7 +517,9 @@ impl Torrent {
                 // Get pipeline config (peer_ctrl only, released immediately)
                 let needed = {
                     let ctrl = peer_ctrl.lock().await;
-                    ctrl[peer_index].max_pipeline.saturating_sub(ctrl[peer_index].pending_requests)
+                    ctrl[peer_index]
+                        .max_pipeline
+                        .saturating_sub(ctrl[peer_index].pending_requests)
                 };
 
                 // Request blocks (only piece_picker held, no peer_ctrl)
@@ -560,7 +608,7 @@ impl Torrent {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TorrentState {
     Downloading,
     Seeding,

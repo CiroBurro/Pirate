@@ -14,6 +14,12 @@ pub struct Peer {
     pub status: PeerStatus,
 }
 
+impl PartialEq for Peer {
+    fn eq(&self, other: &Self) -> bool {
+        self.ip.eq(&other.ip) && self.port.eq(&other.port)
+    }
+}
+
 impl Peer {
     pub fn from_stream(stream: TcpStream) -> Result<Self> {
         let addr = stream.peer_addr()?;

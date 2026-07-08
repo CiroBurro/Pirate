@@ -194,13 +194,13 @@ impl App {
 
         let x_axis = Axis::default()
             .title("Seconds".blue())
-            .bounds([0.0, 100.0])
+            .bounds([0.0, 200.0])
             .labels(["0", "100", "200"]);
 
         let y_axis = Axis::default()
             .title("MB".blue())
-            .bounds([0.0, 5.0])
-            .labels(["0", "2.5", "5"]);
+            .bounds([0.0, 15.0])
+            .labels(["0", "10", "15"]);
         let chart = Chart::new(vec![dataset])
             .x_axis(x_axis)
             .y_axis(y_axis)

@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use std::net::IpAddr;
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 fn read_trackers(torrent: &Torrent) -> Vec<String> {
     let mut trackers = vec![torrent.file.announce.clone()];
@@ -47,22 +47,18 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
         );
     }
 
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(Ok(peers)) => {
-                info!(peers_number = peers.len(), "Peers' list obtained.");
-                return Ok(peers);
-            }
-            Ok(Err(e)) => {
-                warn!(error = ?e, "A tracker failed, waiting for the others.");
-            }
-            Err(e) => {
-                warn!("A tracker task crashed: {}", e);
-            }
-        }
-    }
+    let peers = set
+        .join_all()
+        .await
+        .into_iter()
+        .filter(|r| r.is_ok())
+        .flat_map(|r| r.unwrap().into_iter())
+        .collect::<Vec<_>>();
 
-    bail!("All trackers failed");
+    if peers.is_empty() {
+        bail!("All trackers failed");
+    }
+    Ok(peers)
 }
 
 #[instrument(skip(torrent))]
@@ -154,9 +150,10 @@ pub async fn tracker_handshake(
 
     peer_res.truncate(size);
 
-    Ok(AnnounceResponse::parse(peer_res)
-        .with_context(|| format!("Failed to parse announce response from tracker: {url}"))?
-        .peers)
+    let res = AnnounceResponse::parse(peer_res)
+        .with_context(|| format!("Failed to parse announce response from tracker: {url}"))?;
+
+    Ok(res.peers)
 }
 
 #[derive(Debug)]
