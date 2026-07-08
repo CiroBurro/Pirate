@@ -49,9 +49,10 @@ impl Peer {
             .with_context(|| format!("Failed to send handshake to peer: {}", self))?;
 
         let mut buf = [0u8; 68];
-        stream.read_exact(&mut buf).await.with_context(|| {
-            format!("Failed to read handshake response from peer: {}", self)
-        })?;
+        stream
+            .read_exact(&mut buf)
+            .await
+            .with_context(|| format!("Failed to read handshake response from peer: {}", self))?;
 
         self.status.stream = Some(stream);
 
@@ -141,12 +142,14 @@ pub struct PeerStatus {
     pub bitfield: BitField,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct SharedPeerCtrl {
     pub am_choking: bool,
     pub peer_interested: bool,
     pub uploaded: u64,
     pub uploaded_prev: u64,
+    pub max_pipeline: usize,
+    pub pending_requests: usize,
 }
 
 impl Default for SharedPeerCtrl {
@@ -156,6 +159,8 @@ impl Default for SharedPeerCtrl {
             peer_interested: false,
             uploaded: 0,
             uploaded_prev: 0,
+            max_pipeline: 20,
+            pending_requests: 0,
         }
     }
 }

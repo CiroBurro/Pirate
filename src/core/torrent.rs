@@ -298,6 +298,9 @@ impl Torrent {
         path: PathBuf,
         mut peer_cmd_rx: Receiver<PeerCommand>,
     ) -> Result<()> {
+        if piece_picker.lock().await.missing_pieces <= 5 {
+            peer_ctrl.lock().await[peer_index].max_pipeline = 1;
+        }
         loop {
             tokio::select! {
                 msg_result = Self::read_msg(&mut peer, Arc::clone(&piece_picker)) => {
@@ -334,12 +337,21 @@ impl Torrent {
                         }
                         Some(PeerCommand::RequestBlock) => {
                             if !peer.status.am_choked {
-                                let block = piece_picker.lock().await.pick(&peer.status.bitfield);
-                                if let Some(b) = block {
-                                    peer.send_msg(
-                                        Message::request(b.to_payload().as_slice().try_into()?),
-                                    )
-                                    .await?;
+                                let needed = {
+                                    let ctrl = peer_ctrl.lock().await;
+                                    ctrl[peer_index].max_pipeline.saturating_sub(ctrl[peer_index].pending_requests)
+                                };
+                                for _ in 0..needed {
+                                    let block = piece_picker.lock().await.pick(&peer.status.bitfield);
+                                    if let Some(b) = block {
+                                        peer.send_msg(
+                                            Message::request(b.to_payload().as_slice().try_into()?),
+                                        )
+                                        .await?;
+                                        peer_ctrl.lock().await[peer_index].pending_requests += 1;
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -352,7 +364,7 @@ impl Torrent {
 
     async fn read_msg(peer: &mut Peer, piece_picker: Arc<Mutex<PiecePicker>>) -> Result<Message> {
         let readable = if let Some(stream) = peer.status.stream.as_ref() {
-            tokio::time::timeout(std::time::Duration::from_secs(5), stream.readable()).await
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.readable()).await
         } else {
             debug!("No readable stream");
             return Err(anyhow::anyhow!("No readable stream"));
@@ -408,11 +420,20 @@ impl Torrent {
             }
             MessageId::Unchoke => {
                 peer.status.am_choked = false;
-                let block = piece_picker.lock().await.pick(&peer.status.bitfield);
-                if let Some(b) = block {
-                    peer.send_msg(Message::request(b.to_payload().as_slice().try_into()?))
-                        .await
-                        .context("[!] Failed to send request message to the peer")?;
+                let needed = {
+                    let ctrl = peer_ctrl.lock().await;
+                    ctrl[peer_index].max_pipeline.saturating_sub(ctrl[peer_index].pending_requests)
+                };
+                for _ in 0..needed {
+                    let block = piece_picker.lock().await.pick(&peer.status.bitfield);
+                    if let Some(b) = block {
+                        peer.send_msg(Message::request(b.to_payload().as_slice().try_into()?))
+                            .await
+                            .context("[!] Failed to send request message to the peer")?;
+                        peer_ctrl.lock().await[peer_index].pending_requests += 1;
+                    } else {
+                        break;
+                    }
                 }
                 Ok(0)
             }
@@ -423,6 +444,9 @@ impl Torrent {
                 Ok(0)
             }
             MessageId::Piece => {
+                // Decrement pending (peer_ctrl only, released immediately)
+                peer_ctrl.lock().await[peer_index].pending_requests -= 1;
+
                 let mut picker = piece_picker.lock().await;
                 let index = u32::from_be_bytes(msg.payload[0..4].try_into()?) as usize;
                 let offset = u32::from_be_bytes(msg.payload[4..8].try_into()?);
@@ -438,18 +462,29 @@ impl Torrent {
                     None
                 };
 
-                let (next_block, piece_data) = (picker.pick(&peer.status.bitfield), data_to_save);
-
-                if let Some((piece_index, data)) = piece_data {
+                if let Some((piece_index, data)) = data_to_save {
                     Piece::write_to_disk(piece_index, &data, &file, path)
                         .await
                         .context("[!] Failed to write received block to disk, retrying...")?;
                 }
 
-                if let Some(b) = next_block {
-                    peer.send_msg(Message::request(b.to_payload().as_slice().try_into()?))
-                        .await
-                        .context("[!] Failed to send next block request message to the peer")?;
+                // Get pipeline config (peer_ctrl only, released immediately)
+                let needed = {
+                    let ctrl = peer_ctrl.lock().await;
+                    ctrl[peer_index].max_pipeline.saturating_sub(ctrl[peer_index].pending_requests)
+                };
+
+                // Request blocks (only piece_picker held, no peer_ctrl)
+                for _ in 0..needed {
+                    let block = picker.pick(&peer.status.bitfield);
+                    if let Some(b) = block {
+                        peer.send_msg(Message::request(b.to_payload().as_slice().try_into()?))
+                            .await
+                            .context("[!] Failed to send next block request message to the peer")?;
+                        peer_ctrl.lock().await[peer_index].pending_requests += 1;
+                    } else {
+                        break;
+                    }
                 }
                 Ok(0)
             }
