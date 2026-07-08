@@ -21,14 +21,14 @@ impl std::io::Write for LogBuffer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer
             .lock()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
             .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.buffer
             .lock()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
             .flush()
     }
 }

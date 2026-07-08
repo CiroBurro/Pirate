@@ -6,16 +6,20 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Constraint::{Length, Min, Percentage};
 use ratatui::layout::{Layout, Rect};
 use ratatui::prelude::{Modifier, Stylize};
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
-use ratatui::{DefaultTerminal, Frame};
-use std::collections::VecDeque;
+use ratatui::widgets::{
+    Axis, Block, Chart, Clear, Dataset, GraphType, LineGauge, Paragraph, Row, Table, TableState,
+};
+use ratatui::{symbols, DefaultTerminal, Frame};
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
 pub struct App {
     screen: Screen,
     torrents: Vec<TorrentInfo>,
+    speed_data: HashMap<TorrentId, Vec<(f64, f64)>>,
     table_state: TableState,
     should_quit: bool,
     show_err_popup: bool,
@@ -29,6 +33,7 @@ impl Default for App {
         Self {
             screen: Screen::default(),
             torrents: Vec::new(),
+            speed_data: HashMap::new(),
             table_state: TableState::default(),
             should_quit: false,
             show_err_popup: false,
@@ -49,11 +54,14 @@ impl App {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut data_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+
         while !self.should_quit {
             terminal.draw(|f| self.draw(f, client.get_log()))?;
 
             tokio::select! {
                 _ = tick.tick() => self.torrents = client.all_torrents().await,
+                _ = data_timer.tick() => self.update_speed_data(),
                 Some(key) = key_rx.recv() => self.handle_key(key, client).await,
             }
         }
@@ -61,6 +69,27 @@ impl App {
         client.shutdown().await;
         Ok(())
     }
+
+    fn update_speed_data(&mut self) {
+        self.torrents.iter().for_each(|i| {
+            let id = i.id;
+            let rate = i.download_rate / 1_000_000.0;
+
+            if let std::collections::hash_map::Entry::Vacant(e) = self.speed_data.entry(id) {
+                e.insert(vec![(0.0, rate)]);
+            } else {
+                let data = self.speed_data.get_mut(&id).unwrap();
+                let last_instant = data.last().unwrap().0;
+                if last_instant >= 200.0 {
+                    data.clear();
+                    data.push((0.0, rate));
+                } else {
+                    data.push((last_instant + 1.0, rate));
+                }
+            }
+        })
+    }
+
     fn draw(&mut self, frame: &mut Frame<'_>, log: String) {
         if !log.is_empty() {
             self.logs.push_back(log);
@@ -75,13 +104,15 @@ impl App {
             self.logs.pop_front();
         }
 
-        let [main_area, footer] = Layout::vertical([Min(0), Length(1)]).areas(frame.area());
+        let [main_area, footer] = Layout::vertical([Min(0), Length(1)])
+            .spacing(1)
+            .areas(frame.area());
         match self.screen {
             Screen::Main => {
                 self.draw_main(frame, main_area);
             }
-            Screen::Detail { id } => {
-                self.draw_detailed(frame, main_area, id);
+            Screen::Detail { selected } => {
+                self.draw_detailed(frame, main_area, selected);
             }
             Screen::Log => {
                 self.draw_log(frame, main_area, text);
@@ -129,7 +160,55 @@ impl App {
             .row_highlight_style(Modifier::REVERSED);
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
-    fn draw_detailed(&self, _frame: &mut Frame<'_>, _area: Rect, _id: TorrentId) {}
+    fn draw_detailed(&self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
+        let info = &self.torrents[selected];
+        let block = Block::bordered().bold().fg(Color::Cyan).bg(Color::Black);
+
+        let inner_area = block.inner(area);
+
+        frame.render_widget(block.clone().title(info.name.clone()), area);
+
+        let [top, bottom] =
+            inner_area.layout(&Layout::vertical([Percentage(70), Percentage(30)]).spacing(4));
+
+        let [t_left, t_right] =
+            top.layout(&Layout::horizontal([Percentage(40), Percentage(60)]).spacing(1));
+
+        let paragraph = Paragraph::new(info.to_string())
+            .white()
+            .block(block.clone().title("Torrent info"));
+
+        let gauge = LineGauge::default()
+            .filled_style(Style::new().white().on_cyan().bold())
+            .unfilled_style(Style::new().cyan().on_black())
+            .label("Progress:")
+            .ratio(info.progress / 100.0)
+            .filled_symbol(symbols::line::THICK_HORIZONTAL)
+            .unfilled_symbol(symbols::line::THICK_HORIZONTAL);
+
+        let dataset = Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Color::Red)
+            .data(self.speed_data.get(&info.id).unwrap());
+
+        let x_axis = Axis::default()
+            .title("Seconds".blue())
+            .bounds([0.0, 100.0])
+            .labels(["0", "100", "200"]);
+
+        let y_axis = Axis::default()
+            .title("MB".blue())
+            .bounds([0.0, 5.0])
+            .labels(["0", "2.5", "5"]);
+        let chart = Chart::new(vec![dataset])
+            .x_axis(x_axis)
+            .y_axis(y_axis)
+            .block(block.title("Download speed"));
+        frame.render_widget(paragraph, t_left);
+        frame.render_widget(chart, t_right);
+        frame.render_widget(gauge, bottom);
+    }
     fn draw_log(&mut self, frame: &mut Frame<'_>, area: Rect, text: String) {
         let block = Block::bordered()
             .bold()
@@ -184,9 +263,8 @@ impl App {
                 self.table_state.select(Some((i + 1).min(max)));
             }
             KeyCode::Enter if selected.is_some() => {
-                let torrent_selected = self.torrents[selected.unwrap()].clone();
                 self.screen = Screen::Detail {
-                    id: torrent_selected.id,
+                    selected: selected.unwrap(),
                 }
             }
             KeyCode::Char('p') if selected.is_some() => {

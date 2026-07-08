@@ -556,6 +556,24 @@ pub struct TorrentInfo {
     pub upload_rate: f64,
 }
 
+impl Display for TorrentInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}\nSize: {}\nStatus: {}\nDownloaded: {:.2} MB\nDownload speed: {:.2} MB/s\nUploaded: {:.2} MB\nUpload speed: {:.2} MB/s\nDownload directory: {}\nInfo hash: {}",
+            self.name,
+            self.total_size,
+            self.state,
+            self.downloaded as f64 / 1_000_000.0,
+            self.download_rate / 1_000_000.0,
+            self.uploaded as f64 / 1_000_000.0,
+            self.upload_rate / 100_000.0, // Upload rates updates every 10s so to get MB/s must divide by 1_000_000 and multiply by 10
+            self.download_dir.display(),
+            hex::encode(self.info_hash),
+        )
+    }
+}
+
 impl TorrentInfo {
     pub fn new(
         id: TorrentId,
