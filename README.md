@@ -13,6 +13,12 @@ Apart from that the vast majority of the code is completely human written.
 
 ---
 
+
+
+https://github.com/user-attachments/assets/b460710f-6e17-4aac-8bd9-532b63ce6058
+
+
+
 ## Features
 
 - **Multi-torrent management** — add, pause, resume, and remove torrents at runtime
