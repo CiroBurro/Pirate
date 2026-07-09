@@ -1,5 +1,15 @@
+//! BitTorrent wire protocol messages.
+//!
+//! Implements the peer-wire protocol defined in
+//! [BEP 3 § peer-wire-protocol](https://www.bittorrent.org/beps/bep_0003.html#peer-wire-protocol).
+//!
+//! Every message on the wire follows the format:
+//! `<length prefix: u32><message ID: u8><payload ...>`
+//! A length prefix of 0 designates a keep-alive message.
+
 use anyhow::{Context, Result, anyhow};
 
+/// Identifiers for every message type in the BitTorrent protocol.
 #[derive(Debug)]
 pub enum MessageId {
     Choke,
@@ -49,14 +59,22 @@ impl From<&MessageId> for u8 {
     }
 }
 
+/// A parsed or serialized peer-wire protocol message.
 #[derive(Debug)]
 pub struct Message {
+    /// Total payload length (excluding the 4-byte length prefix itself).
     pub len: u32,
+    /// The message type identifier.
     pub id: MessageId,
+    /// Raw payload bytes (the part after the message ID byte).
     pub payload: Vec<u8>,
 }
 
 impl Message {
+    /// Parse a message from its raw payload after reading the length prefix.
+    ///
+    /// `len` is the value of the 4-byte length prefix; `data` is the
+    /// rest of the message (not including the length prefix).
     pub fn parse(len: u32, data: Vec<u8>) -> Result<Self> {
         let slice = data.as_slice();
 
@@ -71,6 +89,7 @@ impl Message {
         Ok(Self { len, id, payload })
     }
 
+    /// Serialize the message into its on-wire byte representation.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -84,6 +103,8 @@ impl Message {
 
         buf
     }
+
+    // --- Constructor helpers for each message type ---
 
     pub fn keep_alive() -> Self {
         Self {
@@ -125,6 +146,7 @@ impl Message {
         }
     }
 
+    /// `have` message: notifies a peer that we now own piece `index`.
     pub fn have(index: u32) -> Self {
         Self {
             len: 5,
@@ -133,6 +155,7 @@ impl Message {
         }
     }
 
+    /// `bitfield` message: initial bitmap of pieces we own.
     pub fn bitfield(payload: Vec<u8>) -> Self {
         Self {
             len: 1 + payload.len() as u32,
@@ -141,6 +164,8 @@ impl Message {
         }
     }
 
+    /// `request` message: ask a peer for a block.
+    /// Payload is 12 bytes: `[piece_index: u32][offset: u32][length: u32]`.
     pub fn request(payload: [u8; 12]) -> Self {
         Self {
             len: 13,
@@ -149,6 +174,8 @@ impl Message {
         }
     }
 
+    /// `piece` message: response containing actual block data.
+    /// Payload is 8 bytes header `[piece_index: u32][offset: u32]` + data.
     pub fn piece(payload: Vec<u8>) -> Self {
         Self {
             len: 9 + payload.len() as u32,
@@ -157,6 +184,7 @@ impl Message {
         }
     }
 
+    /// `cancel` message: cancel a previously-requested block.
     pub fn cancel(payload: [u8; 12]) -> Self {
         Self {
             len: 13,

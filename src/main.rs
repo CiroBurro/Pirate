@@ -1,3 +1,7 @@
+//! Pirate — an async BitTorrent client.
+//!
+//! Entry point, CLI dispatch, tracing initialization, and the TUI event loop.
+
 pub mod cli;
 pub mod client;
 pub mod core;
@@ -6,23 +10,21 @@ pub mod persistence;
 pub mod tui;
 
 use crate::cli::{Args, ConfigCommands, MainCommands};
-use crate::client::Config;
+use crate::client::{Client, Config};
 use crate::log::LogBuffer;
 use crate::persistence::Persistent;
 use crate::tui::app::App;
 use clap::Parser;
-use client::Client;
-use ratatui::crossterm;
-use ratatui::crossterm::event::Event;
+use ratatui::crossterm::{self, event::Event};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, Layer};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize the in-memory log buffer and wire it into tracing-subscriber.
+    // This lets the TUI display logs captured from info!/warn!/error! calls.
     let log_buffer = LogBuffer::default();
     tracing_subscriber::registry()
         .with(
@@ -37,6 +39,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut config: Config = Config::load("config").await.unwrap_or_default();
     let mut client;
+
+    // CLI subcommand dispatch.
+    // If a config command is given, apply the change and persist immediately.
+    // If an add command is given, create the client and add the torrent.
+    // If no command is given, create the client and open the TUI.
     if let Some(arg) = args.command {
         match arg {
             MainCommands::Config { action } => {
@@ -84,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
         client = Client::new(config, log_buffer).await?;
     }
 
+    // Spawn a dedicated OS thread to read keyboard events via crossterm.
+    // We do this in a separate thread because crossterm's event API is blocking
+    // and must not run on the tokio async runtime.
     let (key_tx, key_rx) = mpsc::channel(32);
     std::thread::spawn(move || {
         loop {
@@ -96,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Enter the ratatui TUI: draw loop + key event handling.
     let mut terminal = ratatui::init();
     App::default()
         .run(&mut terminal, key_rx, &mut client)

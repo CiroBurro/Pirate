@@ -1,11 +1,25 @@
+//! Generic persistence trait and implementations.
+//!
+//! Data is stored under the platform's data directory (e.g.
+//! `~/.local/share/pirate/` on Linux).
+
 #![allow(async_fn_in_trait)]
 
 pub mod resume_data;
 pub mod session;
 
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 
+/// A generic trait for saving/loading state to/from the filesystem as JSON.
+///
+/// # Default implementation
+///
+/// - `save`: serializes `self` to pretty-printed JSON and writes it to
+///   `{data_dir}/pirate/{file_name}.json`.
+/// - `load`: reads the JSON file from the same path and deserializes it.
+///
+/// Types that need a non-JSON format (e.g. binary resume data) override
+/// one or both methods.
 pub trait Persistent {
     async fn save(&self, file_name: &str) -> anyhow::Result<()>
     where

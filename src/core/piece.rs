@@ -1,28 +1,42 @@
+//! Piece and block management — the lowest level of the download engine.
+//!
+//! A **piece** is a ~512 KB (configurable) chunk of the torrent's data.
+//! Each piece is split into **blocks** of [`BLOCK_SIZE`] (16 KB) for wire
+//! transfer. The [`PiecePicker`] implements the rarest-first selection
+//! strategy to decide which block to request next.
+
 use crate::core::{bitfield::BitField, torrent_file::TorrentFile};
 use anyhow::Result;
 use sha1::{Digest, Sha1};
 use std::path::PathBuf;
-use tokio::io::AsyncReadExt;
-use tokio::{
-    fs::OpenOptions,
-    io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
-};
+use tokio::{fs::OpenOptions, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}};
 
+/// Standard block size for wire transfer (16 KB).
 const BLOCK_SIZE: usize = 16384;
 
+/// Status of a single block within a piece.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum BlockStatus {
+    /// Not yet requested from any peer.
     Free,
+    /// Currently requested from a peer (awaiting response).
     Requested,
+    /// Data received and stored.
     Downloaded,
 }
 
+/// A single block — the atomic unit of data transfer on the wire.
+///
+/// Blocks are 16 KB each (except possibly the last block of a piece).
 #[derive(Debug, Clone, Copy)]
 pub struct Block {
     pub piece_index: usize,
+    /// Byte offset of this block within its parent piece.
     pub offset: usize,
     pub length: usize,
     pub status: BlockStatus,
+    /// Countdown timer for request timeout (decremented every second).
+    /// When it reaches 0, the block is freed for re-request.
     pub timer: usize,
 }
 
@@ -37,6 +51,8 @@ impl Block {
         }
     }
 
+    /// Serialize this block into the 12-byte `request` message payload:
+    /// `[piece_index: u32][offset: u32][length: u32]`.
     pub fn to_payload(&self) -> Vec<u8> {
         [
             (self.piece_index as u32).to_be_bytes(),
@@ -47,26 +63,36 @@ impl Block {
     }
 }
 
+/// Lifecycle status of an entire piece.
 #[derive(Debug, PartialEq)]
 pub enum PieceStatus {
+    /// No blocks downloaded yet; available for picking.
     Missing,
+    /// At least one block requested or received, but not complete.
     Downloading,
+    /// All blocks received; SHA-1 hash verification in progress.
     Verifying,
+    /// SHA-1 hash verified; piece is ready.
     Completed,
 }
 
+/// A torrent piece — a contiguous range of the download.
 #[derive(Debug)]
 pub struct Piece {
     pub index: usize,
+    /// Expected SHA-1 hash from the .torrent metainfo.
     pub hash: [u8; 20],
     pub status: PieceStatus,
     pub length: usize,
+    /// Sub-divisions of this piece (blocks).
     pub blocks: Vec<Block>,
     pub missing_blocks: usize,
+    /// Accumulated block data (filled as blocks arrive).
     pub data: Vec<u8>,
 }
 
 impl Piece {
+    /// Create a new piece, splitting it into [`BLOCK_SIZE`] blocks.
     pub fn new(index: usize, hash: [u8; 20], length: usize) -> Self {
         let num_blocks = length.div_ceil(BLOCK_SIZE);
         let mut blocks = Vec::new();
@@ -92,6 +118,10 @@ impl Piece {
         }
     }
 
+    /// Write a completed piece to disk.
+    ///
+    /// Handles both single-file and multi-file torrents by mapping the
+    /// piece's global byte offset to the correct file + local offset.
     pub async fn write_to_disk(
         index: usize,
         data: &[u8],
@@ -107,6 +137,7 @@ impl Piece {
         base_path.push(&file.info.name);
 
         if let Some(files) = &file.info.files {
+            // Multi-file torrent: distribute bytes across files.
             let mut current_file_start = 0;
             for file in files {
                 let current_file_end = current_file_start + file.length;
@@ -150,6 +181,7 @@ impl Piece {
                 }
             }
         } else {
+            // Single-file torrent: direct write at the piece offset.
             if let Some(parent) = base_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
@@ -169,6 +201,7 @@ impl Piece {
         Ok(())
     }
 
+    /// Read a specific byte range from a piece on disk (used for seeding).
     pub async fn read_from_disk(
         index: usize,
         offset: u32,
@@ -225,18 +258,29 @@ impl Piece {
         Ok(result)
     }
 
+    /// Verify the piece data against the expected SHA-1 hash.
     pub fn verify(&mut self) -> bool {
         let hash = Sha1::digest(&self.data);
         hash == self.hash
     }
 }
 
+/// Piece selection logic implementing the **rarest-first** strategy.
+///
+/// Maintains:
+/// - A local [`BitField`] of completed pieces (for upload / have messages).
+/// - A frequency map counting how many peers have each piece.
+/// - A count of missing (not yet completed) pieces.
 #[derive(Debug)]
 pub struct PiecePicker {
     pub pieces: Vec<Piece>,
+    /// Our own bitfield — which pieces we've completed.
     pub bitfield: BitField,
+    /// How many peers have reported having each piece index.
     pub piece_frequencies: Vec<usize>,
+    /// Number of pieces still missing (not completed).
     pub missing_pieces: usize,
+    /// When paused, `pick()` returns `None`.
     pub paused: bool,
 }
 
@@ -246,12 +290,14 @@ impl PiecePicker {
         Self {
             pieces,
             bitfield: BitField::with_pieces(num_pieces),
+            // All pieces have frequency 0 until a peer bitfield arrives.
             piece_frequencies: vec![0; num_pieces],
             missing_pieces: num_pieces,
             paused: false,
         }
     }
 
+    /// Update frequencies from a peer's bitfield (sent on connect).
     pub fn add_peer_bitfield(&mut self, bitfield: &BitField) {
         for i in 0..self.pieces.len() {
             if bitfield.has_piece(i) {
@@ -260,16 +306,25 @@ impl PiecePicker {
         }
     }
 
+    /// Increment frequency for a single piece (from a `have` message).
     pub fn add_peer_have(&mut self, index: usize) {
         if index < self.piece_frequencies.len() {
             self.piece_frequencies[index] += 1;
         }
     }
 
+    /// Pick the best block to request next from a given peer.
+    ///
+    /// Strategy (two-phase):
+    /// 1. **Endgame**: if any piece is already in `Downloading` state and
+    ///    this peer has it, pick its first free block (keep pipelines full).
+    /// 2. **Rarest-first**: among `Missing` pieces that this peer has,
+    ///    pick the one with the lowest frequency across all peers.
     pub fn pick(&mut self, bitfield: &BitField) -> Option<Block> {
         if self.paused {
             return None;
         }
+        // Phase 1: fill blocks already in progress.
         for piece in self.pieces.iter_mut() {
             if piece.status == PieceStatus::Downloading
                 && bitfield.has_piece(piece.index)
@@ -283,6 +338,7 @@ impl PiecePicker {
             }
         }
 
+        // Phase 2: pick a new rarest missing piece.
         let mut missing_pieces: Vec<&mut Piece> = self
             .pieces
             .iter_mut()
@@ -293,6 +349,7 @@ impl PiecePicker {
             return None;
         }
 
+        // Find the rarest: the piece with the lowest frequency.
         let frequencies: Vec<usize> = missing_pieces
             .iter()
             .map(|p| self.piece_frequencies[p.index])
@@ -319,6 +376,12 @@ impl PiecePicker {
         }
     }
 
+    /// Process an incoming block of data.
+    ///
+    /// Returns `Ok(true)` if the piece is now complete and verified.
+    /// Returns `Ok(false)` if more blocks are still needed.
+    /// On hash mismatch, the entire piece is reset to `Missing` and all
+    /// blocks are freed for re-download.
     pub fn handle_piece(&mut self, index: usize, offset: u32, data: &[u8]) -> Result<bool> {
         let piece: &mut Piece = self
             .pieces
@@ -329,6 +392,7 @@ impl PiecePicker {
         if block_idx >= piece.blocks.len() {
             return Err(anyhow::anyhow!("Invalid block offset"));
         }
+        // Guard: skip duplicate block data.
         if piece.blocks[block_idx].status == BlockStatus::Downloaded {
             return Ok(false);
         }
@@ -344,6 +408,7 @@ impl PiecePicker {
 
         piece.blocks[block_idx].status = BlockStatus::Downloaded;
 
+        // If all blocks are in, verify the SHA-1 hash.
         if piece.missing_blocks == 0 {
             piece.status = PieceStatus::Verifying;
 
@@ -353,6 +418,7 @@ impl PiecePicker {
                 self.missing_pieces -= 1;
                 Ok(true)
             } else {
+                // Hash mismatch — reset the piece for re-download.
                 piece.data.fill(0);
                 piece.status = PieceStatus::Missing;
                 piece.missing_blocks = piece.blocks.len();
@@ -367,6 +433,10 @@ impl PiecePicker {
         Ok(false)
     }
 
+    /// Restore progress from saved resume data.
+    ///
+    /// Marks pieces as `Completed` based on the bitfield, and updates
+    /// the `missing_pieces` count accordingly.
     pub fn restore(&mut self, bitfield_data: &[u8]) {
         let num_pieces = self.pieces.len();
         if bitfield_data.len() != self.bitfield.data.len() {
@@ -383,6 +453,9 @@ impl PiecePicker {
         self.missing_pieces = num_pieces - restored;
     }
 
+    /// Decrement block request timers every second.
+    /// Blocks that have timed out (timer reached 0) revert to `Free`
+    /// so they can be re-requested from another peer.
     pub fn tick_timeouts(&mut self) {
         for piece in &mut self.pieces {
             if piece.status == PieceStatus::Downloading {

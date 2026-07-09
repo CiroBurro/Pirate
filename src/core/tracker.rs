@@ -1,13 +1,21 @@
-use crate::core::{
-    peer::{Peer, PeerStatus},
-    torrent::Torrent,
-};
+//! UDP tracker protocol implementation.
+//!
+//! Implements the UDP tracker protocol as defined in
+//! [BEP 15](https://www.bittorrent.org/beps/bep_0015.html).
+//!
+//! The protocol is a two-phase request over UDP:
+//! 1. **Connection request** — obtain a connection ID from the tracker.
+//! 2. **Announce request** — send the info hash / peer ID to receive a peer list.
+
+use crate::core::{peer::{Peer, PeerStatus}, torrent::Torrent};
 use anyhow::{bail, Context, Result};
-use std::net::IpAddr;
-use std::{net::Ipv4Addr, time::Duration};
+use std::{net::{IpAddr, Ipv4Addr}, time::Duration};
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
 use tracing::{info, instrument};
 
+/// Collect all unique tracker URLs from the torrent's announce list.
+///
+/// Merges the primary `announce` URL with any `announce-list` tiers (BEP 12).
 fn read_trackers(torrent: &Torrent) -> Vec<String> {
     let mut trackers = vec![torrent.file.announce.clone()];
 
@@ -23,6 +31,10 @@ fn read_trackers(torrent: &Torrent) -> Vec<String> {
     trackers
 }
 
+/// Contact all trackers concurrently and collect the merged peer list.
+///
+/// Spawns a concurrent task per tracker URL. Only the peers from
+/// successful responses are retained. Bails if every tracker fails.
 #[instrument(skip(torrent))]
 pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
     let info_hash = torrent.info_hash;
@@ -61,6 +73,9 @@ pub async fn get_peers(torrent: &Torrent) -> Result<Vec<Peer>> {
     Ok(peers)
 }
 
+/// Send a "completed" event to all trackers (event=1, left=0).
+///
+/// Called when a download finishes so trackers can update swarm stats.
 #[instrument(skip(torrent))]
 pub async fn complete_msg(torrent: &Torrent) {
     let info_hash = torrent.info_hash;
@@ -79,6 +94,12 @@ pub async fn complete_msg(torrent: &Torrent) {
     set.join_all().await;
 }
 
+/// Full UDP tracker handshake: connect → announce → parse peers.
+///
+/// # Errors
+///
+/// Returns an error if the URL is not `udp://`, if any network operation
+/// times out (2 s per phase), or if the response is malformed.
 #[instrument(skip(info_hash, peer_id, left_len))]
 pub async fn tracker_handshake(
     url: String,
@@ -113,6 +134,8 @@ pub async fn tracker_handshake(
         .await
         .with_context(|| format!("Failed to connect to tracker: {url}"))?;
 
+    // --- Phase 1: Connection request ---
+    // Send the magic protocol ID and receive a connection ID.
     let connection_req = ConnectionRequest::default().serialize();
 
     socket
@@ -128,6 +151,8 @@ pub async fn tracker_handshake(
 
     let connection_id = &res[8..16];
     let connection_id = i64::from_be_bytes(connection_id.try_into().unwrap_or([0; 8]));
+
+    // --- Phase 2: Announce request ---
     let announce_req =
         AnnounceRequest::new(connection_id, info_hash, peer_id, left_len as i64, event);
 
@@ -156,6 +181,10 @@ pub async fn tracker_handshake(
     Ok(res.peers)
 }
 
+/// UDP tracker connection request payload (16 bytes).
+///
+/// Sends the magic protocol ID (`0x41727101980`) to obtain
+/// a 64-bit connection ID from the tracker.
 #[derive(Debug)]
 struct ConnectionRequest {
     protocol_id: i64,
@@ -167,7 +196,7 @@ impl Default for ConnectionRequest {
     fn default() -> Self {
         Self {
             protocol_id: 0x41727101980i64,
-            action: 0,
+            action: 0, // 0 = connect
             transaction_id: 12345,
         }
     }
@@ -184,6 +213,10 @@ impl ConnectionRequest {
     }
 }
 
+/// UDP tracker announce request payload (98 bytes).
+///
+/// Sent after obtaining a connection ID. Contains the info hash, peer ID,
+/// download state, and event type (0 = started, 1 = completed).
 struct AnnounceRequest {
     connection_id: i64,
     action: u32,
@@ -248,6 +281,10 @@ impl AnnounceRequest {
     }
 }
 
+/// Parsed announce response from the tracker (BEP 15).
+///
+/// Header is 20 bytes: action, transaction_id, interval, leechers, seeders.
+/// Payload is a sequence of 6-byte peer entries: 4 bytes IPv4 + 2 bytes port.
 #[derive(Debug)]
 struct AnnounceResponse {
     _action: i32,
@@ -264,6 +301,7 @@ impl AnnounceResponse {
 
         let mut peers: Vec<Peer> = Vec::new();
 
+        // Each peer entry is 6 bytes: 4 for IPv4 address, 2 for port.
         for chunk in slice[20..].chunks_exact(6) {
             peers.push(Peer {
                 ip: IpAddr::V4(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3])),

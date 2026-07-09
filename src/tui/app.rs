@@ -1,29 +1,37 @@
+//! TUI application — the terminal user interface built with [ratatui].
+//!
+//! Handles drawing three screens (torrent list, per-torrent detail, logs)
+//! and dispatches keyboard input to client operations.
+
 use crate::client::Client;
 use crate::core::torrent::{TorrentId, TorrentInfo, TorrentState};
 use crate::tui::screen::Screen;
 use anyhow::Result;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Constraint::{Length, Min, Percentage};
-use ratatui::layout::{Layout, Rect};
-use ratatui::prelude::{Modifier, Stylize};
-use ratatui::style::{Color, Style};
-use ratatui::symbols::Marker;
-use ratatui::text::Line;
-use ratatui::widgets::{
-    Axis, Block, Chart, Clear, Dataset, GraphType, LineGauge, Paragraph, Row, Table, TableState,
+use ratatui::{
+    DefaultTerminal, Frame,
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    layout::{Constraint::{Length, Min, Percentage}, Layout, Rect},
+    prelude::{Modifier, Stylize},
+    style::{Color, Style},
+    symbols::{self, Marker},
+    text::Line,
+    widgets::{Axis, Block, Chart, Clear, Dataset, GraphType, LineGauge, Paragraph, Row, Table, TableState},
 };
-use ratatui::{symbols, DefaultTerminal, Frame};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
+/// Main TUI application state.
 pub struct App {
     screen: Screen,
+    /// Snapshot of all torrent info, refreshed every 250 ms.
     torrents: Vec<TorrentInfo>,
+    /// Per-torrent time-series download rate data for the chart.
     speed_data: HashMap<TorrentId, Vec<(f64, f64)>>,
     table_state: TableState,
     should_quit: bool,
     show_err_popup: bool,
     error: String,
+    /// Rolling log buffer for the log screen.
     logs: VecDeque<String>,
     max_logs: usize,
 }
@@ -45,6 +53,11 @@ impl Default for App {
 }
 
 impl App {
+    /// Main TUI event loop.
+    ///
+    /// Runs a draw + input cycle at ~4 Hz (250 ms tick): on each tick the
+    /// torrent list is refreshed, once per second the speed chart data is
+    /// updated, and keyboard events are dispatched as they arrive.
     pub async fn run(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -70,6 +83,8 @@ impl App {
         Ok(())
     }
 
+    /// Append the latest download rate data point for each torrent's chart.
+    /// The chart window is 200 seconds — older data is discarded.
     fn update_speed_data(&mut self) {
         self.torrents.iter().for_each(|i| {
             let id = i.id;
@@ -90,7 +105,10 @@ impl App {
         })
     }
 
+    /// Top-level draw function: dispatch to the active screen and draw
+    /// the persistent footer + optional error popup.
     fn draw(&mut self, frame: &mut Frame<'_>, log: String) {
+        // Append fresh log lines.
         if !log.is_empty() {
             self.logs.push_back(log);
         }
@@ -120,6 +138,7 @@ impl App {
         }
         self.draw_footer(frame, footer);
 
+        // Render error popup if active.
         if self.show_err_popup {
             let popup_block = Block::bordered().title("Error").bold().fg(Color::Red);
             let centered_area = frame.area().centered(Percentage(60), Percentage(20));
@@ -129,6 +148,7 @@ impl App {
         }
     }
 
+    /// Main screen: a table of all torrents (name, progress, downloaded, status).
     fn draw_main(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::bordered()
             .bold()
@@ -160,6 +180,9 @@ impl App {
             .row_highlight_style(Modifier::REVERSED);
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
+
+    /// Detail screen: torrent info panel, download speed chart, and
+    /// a progress gauge.
     fn draw_detailed(&self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
         let info = &self.torrents[selected];
         let block = Block::bordered().bold().fg(Color::Cyan).bg(Color::Black);
@@ -174,10 +197,12 @@ impl App {
         let [t_left, t_right] =
             top.layout(&Layout::horizontal([Percentage(40), Percentage(60)]).spacing(1));
 
+        // Left panel: torrent metadata.
         let paragraph = Paragraph::new(info.to_string())
             .white()
             .block(block.clone().title("Torrent info"));
 
+        // Progress gauge.
         let gauge = LineGauge::default()
             .filled_style(Style::new().white().on_cyan().bold())
             .unfilled_style(Style::new().cyan().on_black())
@@ -186,6 +211,7 @@ impl App {
             .filled_symbol(symbols::line::THICK_HORIZONTAL)
             .unfilled_symbol(symbols::line::THICK_HORIZONTAL);
 
+        // Right panel: download speed line chart over the last 200 s.
         let dataset = Dataset::default()
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
@@ -209,6 +235,8 @@ impl App {
         frame.render_widget(chart, t_right);
         frame.render_widget(gauge, bottom);
     }
+
+    /// Log screen: scrollable tracing output.
     fn draw_log(&mut self, frame: &mut Frame<'_>, area: Rect, text: String) {
         let block = Block::bordered()
             .bold()
@@ -220,6 +248,8 @@ impl App {
 
         frame.render_widget(paragraph, area);
     }
+
+    /// Footer bar showing available keyboard shortcuts.
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let line = match self.screen {
             Screen::Main => Line::from(
@@ -233,6 +263,7 @@ impl App {
         frame.render_widget(line.centered(), area);
     }
 
+    /// Route keyboard events: dismiss error popup or dispatch to screen handler.
     async fn handle_key(&mut self, key: KeyEvent, client: &mut Client) {
         if (key.code == KeyCode::Esc || key.code == KeyCode::Enter) && self.show_err_popup {
             self.show_err_popup = false;
@@ -244,6 +275,8 @@ impl App {
             _ => self.handle_key_secondary(key),
         }
     }
+
+    /// Keyboard handler for the main torrent list screen.
     async fn handle_key_main(&mut self, key: KeyEvent, client: &mut Client) {
         let selected = self.table_state.selected();
         match key.code {
@@ -307,6 +340,8 @@ impl App {
             _ => (),
         }
     }
+
+    /// Keyboard handler for detail/log screens: Esc/Tab returns to main.
     fn handle_key_secondary(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Tab => self.screen = Screen::Main,

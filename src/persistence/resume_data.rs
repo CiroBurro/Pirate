@@ -1,8 +1,19 @@
+//! Resume data persistence — stores partial download progress in a compact
+//! binary format so downloads can be resumed after a restart.
+//!
+//! Unlike the default JSON persistence, [`ResumeData`] uses a custom binary
+//! layout: `[downloaded: u64 big-endian][bitfield bytes ...]`.
+//! The file extension is `.dat` (not `.json`).
+
 use crate::persistence::Persistent;
 use anyhow::Result;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+/// Persisted state for a single torrent's download progress.
+///
+/// Fields:
+/// - `downloaded`: total bytes downloaded (used to estimate resume speed)
+/// - `bitfield_data`: raw bitfield bytes marking which pieces are completed
 #[derive(Serialize, Deserialize)]
 pub struct ResumeData {
     pub downloaded: u64,
@@ -19,6 +30,7 @@ impl ResumeData {
 }
 
 impl Persistent for ResumeData {
+    /// Binary save: 8 bytes (downloaded big-endian) followed by raw bitfield.
     async fn save(&self, file_name: &str) -> Result<()>
     where
         Self: Sized,
@@ -38,6 +50,7 @@ impl Persistent for ResumeData {
         Ok(())
     }
 
+    /// Binary load: parse the 8-byte header, then the remainder as bitfield.
     async fn load(file_name: &str) -> Result<Self>
     where
         Self: Sized,
